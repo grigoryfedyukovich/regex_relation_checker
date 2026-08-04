@@ -5,7 +5,10 @@ use regexrel::analysis::AnalyzeError;
 use regexrel::config::{Alphabet, Config};
 use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
-use regexrel::{analyze_binary, analyze_empty, Query};
+use regexrel::{
+    analyze_binary_with_backend, analyze_empty_with_backend, AutomataBackend, MinimizedBackend,
+    Query, RelationBackend,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -64,8 +67,26 @@ struct Cli {
     #[arg(long, global = true)]
     ci_exit_code: Option<i32>,
 
+    /// Analysis engine to use. Both implement the same regular subset and
+    /// agree on every verdict; this exists to let the two be cross-checked
+    /// against each other, and as a size/technique tradeoff for advanced use.
+    #[arg(long, value_enum, default_value = "automata", global = true)]
+    backend: BackendArg,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum BackendArg {
+    /// On-the-fly subset construction with a single product-BFS over both
+    /// patterns at once. The default; well-exercised, no upfront cost.
+    #[default]
+    Automata,
+    /// Determinize and minimize each pattern first, then check equivalence
+    /// via canonical-form isomorphism (no search needed when it holds) or
+    /// fall back to a product search over the minimized DFAs otherwise.
+    Minimized,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -149,14 +170,21 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         return Ok(0);
     }
 
+    let backend: &dyn RelationBackend = match cli.backend {
+        BackendArg::Automata => &AutomataBackend,
+        BackendArg::Minimized => &MinimizedBackend,
+    };
+
     let mut report = match command {
-        Command::Empty { regex } => analyze_empty(&regex, &config),
-        Command::Overlap { left, right } => analyze_binary(Query::Overlap, &left, &right, &config),
+        Command::Empty { regex } => analyze_empty_with_backend(&regex, &config, backend),
+        Command::Overlap { left, right } => {
+            analyze_binary_with_backend(Query::Overlap, &left, &right, &config, backend)
+        }
         Command::Includes { left, right } => {
-            analyze_binary(Query::Includes, &left, &right, &config)
+            analyze_binary_with_backend(Query::Includes, &left, &right, &config, backend)
         }
         Command::Equivalent { left, right } => {
-            analyze_binary(Query::Equivalent, &left, &right, &config)
+            analyze_binary_with_backend(Query::Equivalent, &left, &right, &config, backend)
         }
         Command::Syntax => unreachable!(),
     }

@@ -1,0 +1,6 @@
+alphabet = "ascii"
+max_product_states = 100000
+timeout_ms = 5000
+max_repeat = 1000
+dot_matches_newline = false
+ci_exit_code = 10

@@ -9,6 +9,7 @@ pub mod analysis;
 pub mod ast;
 pub mod charset;
 pub mod config;
+pub mod minimize;
 pub mod nfa;
 pub mod parser;
 pub mod report;
@@ -18,5 +19,6 @@ pub use analysis::{
     AnalyzeError, AutomataBackend, BackendResult, BackendStatus, Query, RelationBackend,
 };
 pub use config::{Alphabet, Config};
+pub use minimize::MinimizedBackend;
 pub use parser::{parse, FrontendError, FrontendErrorKind};
 pub use report::{BackendInfo, Report, Verdict, Witness};

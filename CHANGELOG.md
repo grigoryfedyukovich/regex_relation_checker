@@ -4,6 +4,8 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Added a second `RelationBackend`: `MinimizedBackend` (`--backend minimized`), which determinizes and minimizes each pattern's automaton, decides `equivalent` via canonical-form isomorphism where possible, and falls back to a product search over the minimized DFAs for `overlap`/`includes` and for `equivalent` when isomorphism fails. `--backend automata` (the previous, still-default behavior) is unchanged.
+
 ## 0.1.1
 
 - Fixed timing totals to include witness extraction without double-counting it inside backend time.
