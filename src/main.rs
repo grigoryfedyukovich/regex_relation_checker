@@ -20,7 +20,20 @@ const TIMING_PLACEHOLDER: &str = "__REGEXREL_TIMING_LINE__";
 #[command(
     name = "regexrel",
     version,
-    about = "Check relations between regular-expression languages"
+    about = "Check relations between regular-expression languages",
+    long_about = "Check relations between regular-expression languages.\n\n\
+When the last argument names an existing readable file (and is not a reserved \
+subcommand name), that file is treated as a benchmark: comment/header lines \
+(leading '#') are stripped, the remaining text is shell-tokenized (supporting \
+single and double quotes), and the resulting tokens become the CLI arguments \
+after any preceding flags. Examples:\n\n\
+    regexrel path/to/bench.md\n\
+    regexrel --backend derivatives path/to/bench.md\n\n\
+where the file contains e.g.\n\n\
+    # overlap: a+b vs ab+\n\
+    overlap 'a+b' 'ab+'\n\n\
+Subcommand names (empty, overlap, includes, equivalent, syntax) are never \
+interpreted as benchmark paths."
 )]
 struct Cli {
     /// TOML configuration file. If omitted, ./regexrel.toml is loaded when present.
@@ -131,8 +144,135 @@ enum Command {
     Syntax,
 }
 
+/// Subcommand names that must always be parsed as subcommands, never as a
+/// candidate benchmark-file path, even in the vanishingly unlikely case a
+/// file with one of these exact names exists in the working directory --
+/// this keeps `regexrel equivalent` (missing its required arguments) failing
+/// with clap's normal "missing required argument" message instead of
+/// silently taking a different code path.
+const RESERVED_SUBCOMMAND_NAMES: [&str; 5] =
+    ["empty", "overlap", "includes", "equivalent", "syntax"];
+
+/// If the last argument names an existing, readable file (and is not a
+/// reserved subcommand name), treat that file as a benchmark: strip any line
+/// whose first non-blank character is `#` (comments, or markdown headers --
+/// same syntax, both get dropped), shell-tokenize what's left (supporting
+/// 'single' and "double" quoting), and use those tokens as the real CLI
+/// arguments after any preceding flags. So a file containing exactly
+///
+///     # overlap: a+b vs ab+
+///     overlap 'a+b' 'ab+'
+///
+/// can be run as `regexrel path/to/that/file.md` or with flags, e.g.
+/// `regexrel --backend derivatives path/to/that/file.md`. Returns `Ok(None)`
+/// (meaning: parse `args` normally, unchanged) whenever this doesn't apply.
+fn expand_benchmark_file(args: &[String]) -> Result<Option<Vec<String>>, String> {
+    if args.len() < 2 {
+        return Ok(None);
+    }
+    let candidate = args.last().unwrap();
+    if RESERVED_SUBCOMMAND_NAMES.contains(&candidate.as_str()) {
+        return Ok(None);
+    }
+    if !Path::new(candidate).is_file() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(candidate)
+        .map_err(|error| format!("could not read benchmark file '{candidate}': {error}"))?;
+    let command_line = strip_comment_lines(&contents);
+    let tokens = tokenize_args(&command_line)
+        .map_err(|error| format!("in benchmark file '{candidate}': {error}"))?;
+    if tokens.is_empty() {
+        return Err(format!(
+            "benchmark file '{candidate}' has no command left after stripping comment/header lines"
+        ));
+    }
+
+    // Keep argv[0] and any flags that preceded the benchmark path.
+    let mut expanded = Vec::with_capacity(args.len() - 1 + tokens.len());
+    expanded.extend_from_slice(&args[..args.len() - 1]);
+    expanded.extend(tokens);
+    Ok(Some(expanded))
+}
+
+fn strip_comment_lines(input: &str) -> String {
+    input
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// A small, deliberately non-general shell-argument tokenizer: whitespace
+/// separates tokens, '...' is a literal run of characters (no escapes
+/// recognized inside, matching POSIX single-quote behavior), and "..."
+/// additionally recognizes \" and \\ as escapes. This covers exactly what a
+/// benchmark file needs (patterns containing spaces, quotes, or metacharacters
+/// like `|`) without trying to be a full shell parser.
+fn tokenize_args(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut have_current = false;
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            if have_current {
+                tokens.push(std::mem::take(&mut current));
+                have_current = false;
+            }
+            continue;
+        }
+        if ch == '\'' {
+            have_current = true;
+            loop {
+                match chars.next() {
+                    Some('\'') => break,
+                    Some(c) => current.push(c),
+                    None => return Err("unterminated ' quote".to_owned()),
+                }
+            }
+            continue;
+        }
+        if ch == '"' {
+            have_current = true;
+            loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some('\\') => match chars.next() {
+                        Some(c @ ('"' | '\\')) => current.push(c),
+                        Some(c) => {
+                            current.push('\\');
+                            current.push(c);
+                        }
+                        None => return Err("unterminated \" quote".to_owned()),
+                    },
+                    Some(c) => current.push(c),
+                    None => return Err("unterminated \" quote".to_owned()),
+                }
+            }
+            continue;
+        }
+        have_current = true;
+        current.push(ch);
+    }
+    if have_current {
+        tokens.push(current);
+    }
+    Ok(tokens)
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let cli = match expand_benchmark_file(&raw_args) {
+        Ok(Some(expanded)) => Cli::parse_from(expanded),
+        Ok(None) => Cli::parse(),
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(INPUT_ERROR_EXIT);
+        }
+    };
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err((code, message)) => {

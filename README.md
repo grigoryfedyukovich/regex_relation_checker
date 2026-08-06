@@ -30,6 +30,46 @@ regexrel --json equivalent '^a+$' 'aa*'
 regexrel --stats --max-states 50000 overlap 'a.*z' 'ab+z'
 ```
 
+## Benchmark files
+
+When the last CLI argument is an existing readable file (and is not a reserved
+subcommand name), the file is treated as a **benchmark**:
+
+1. Lines whose first non-blank character is `#` are dropped (comments and
+   markdown headers).
+2. The remaining text is shell-tokenized (whitespace-separated tokens, with
+   `'single'` and `"double"` quoting; double quotes also recognize `\"` and
+   `\\`).
+3. Those tokens become the real CLI arguments, after any preceding flags.
+
+Example file `bench.md`:
+
+```text
+# overlap: a+b vs ab+
+overlap 'a+b' 'ab+'
+```
+
+```bash
+regexrel bench.md
+# YES
+# shortest witness: "ab"
+
+regexrel --backend derivatives bench.md
+```
+
+The `bench/yes/` and `bench/no/` directories contain such files. A helper
+script `./bench/run.sh` (run from the project root after a release
+build) executes every file and checks that the first output line is `YES`
+or `NO` according to the folder. Optional `--keep-going` and one extra
+quoted argument (forwarded to `regexrel`) are supported:
+
+```bash
+./bench/run.sh
+./bench/run.sh --keep-going
+./bench/run.sh "--backend derivatives"
+./bench/run.sh --keep-going "--backend minimized --max-states 20000"
+```
+
 ## Semantics
 
 Matching is **full-string matching**. Therefore `a` denotes exactly the one-character string `"a"`, not a substring search. Outer `^` and `$` are accepted as explicit documentation of the same semantics; anchors elsewhere are unsupported.
