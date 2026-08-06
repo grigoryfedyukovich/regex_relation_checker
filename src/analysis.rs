@@ -74,6 +74,31 @@ pub trait RelationBackend {
     ) -> BackendResult;
 
     fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult;
+
+    /// AST-aware entry point. Backends that work from residual expressions
+    /// (e.g. Brzozowski derivatives) override this; the default delegates to
+    /// the NFA-based path so existing backends stay unchanged.
+    fn analyze_binary_expr(
+        &self,
+        query: Query,
+        _left_expr: &crate::ast::Expr,
+        _right_expr: &crate::ast::Expr,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        self.analyze_binary(query, left, right, config)
+    }
+
+    /// AST-aware emptiness entry point. Default delegates to [`analyze_empty`].
+    fn analyze_empty_expr(
+        &self,
+        _expr: &crate::ast::Expr,
+        nfa: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        self.analyze_empty(nfa, config)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -159,7 +184,8 @@ pub fn analyze_binary_with_backend(
     let left = Nfa::from_expr(&left_expr);
     let right = Nfa::from_expr(&right_expr);
     let build_elapsed = build_started.elapsed();
-    let outcome = backend.analyze_binary(query, &left, &right, config);
+    let outcome =
+        backend.analyze_binary_expr(query, &left_expr, &right_expr, &left, &right, config);
     let mut report = report_from_binary_outcome(
         query,
         &left,
@@ -202,7 +228,7 @@ pub fn analyze_empty_with_backend(
     let build_started = Instant::now();
     let nfa = Nfa::from_expr(&expr);
     let build_elapsed = build_started.elapsed();
-    let outcome = backend.analyze_empty(&nfa, config);
+    let outcome = backend.analyze_empty_expr(&expr, &nfa, config);
     let mut report =
         report_from_empty_outcome(&nfa, outcome, config, parse_elapsed, build_elapsed, backend);
     validate_empty_witness(&mut report, &nfa)?;

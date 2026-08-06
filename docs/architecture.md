@@ -57,7 +57,7 @@ Each discovered node stores one predecessor and character. Reconstructing that c
 
 ## Backend boundary
 
-The default backend is an in-process exact automata backend. No solver or subprocess is used. The public `RelationBackend` trait accepts compiled NFAs and returns evidence plus statistics; `analyze_*_with_backend` keeps report assembly and witness replay outside the backend. Tests include deterministic fake backends to verify this boundary.
+The default backend is an in-process exact automata backend. No solver or subprocess is used. The public `RelationBackend` trait accepts compiled NFAs and returns evidence plus statistics; `analyze_*_with_backend` keeps report assembly and witness replay outside the backend. AST-aware backends (Brzozowski derivatives) override `analyze_*_expr` entry points so residual expressions can be derived without reconstructing the AST from an NFA. Tests include deterministic fake backends and multi-backend differential agreement checks to verify this boundary.
 
 ## Caching
 

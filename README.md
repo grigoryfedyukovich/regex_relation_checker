@@ -2,7 +2,7 @@
 
 `regexrel` decides exact language relations for a documented regular-expression subset. It can check emptiness, overlap, left-to-right inclusion, and equivalence, and it emits a shortest witness whenever a relation fails or overlap succeeds.
 
-The implementation is intentionally small and auditable: a hand-written frontend lowers regexes to a language-neutral AST, Thompson construction produces epsilon-NFAs, and an on-the-fly subset/product BFS searches the exact finite automata state space. Resource exhaustion yields `UNKNOWN`, never a guessed answer.
+The implementation is intentionally small and auditable: a hand-written frontend lowers regexes to a language-neutral AST, Thompson construction produces epsilon-NFAs, and an on-the-fly subset/product BFS searches the exact finite automata state space. Optional backends include minimized DFAs (`--backend minimized`) and Brzozowski derivatives (`--backend derivatives`). Resource exhaustion yields `UNKNOWN`, never a guessed answer.
 
 ## Two-minute demo
 

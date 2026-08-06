@@ -6,8 +6,8 @@ use regexrel::config::{Alphabet, Config};
 use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
-    analyze_binary_with_backend, analyze_empty_with_backend, AutomataBackend, MinimizedBackend,
-    Query, RelationBackend,
+    analyze_binary_with_backend, analyze_empty_with_backend, AutomataBackend, DerivativeBackend,
+    MinimizedBackend, Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -67,8 +67,8 @@ struct Cli {
     #[arg(long, global = true)]
     ci_exit_code: Option<i32>,
 
-    /// Analysis engine to use. Both implement the same regular subset and
-    /// agree on every verdict; this exists to let the two be cross-checked
+    /// Analysis engine to use. All backends implement the same regular subset
+    /// and agree on every verdict; this exists to let them be cross-checked
     /// against each other, and as a size/technique tradeoff for advanced use.
     #[arg(long, value_enum, default_value = "automata", global = true)]
     backend: BackendArg,
@@ -87,6 +87,10 @@ enum BackendArg {
     /// via canonical-form isomorphism (no search needed when it holds) or
     /// fall back to a product search over the minimized DFAs otherwise.
     Minimized,
+    /// Brzozowski derivatives: residual expressions + product BFS over
+    /// normalized residual pairs. A third independent technique for
+    /// cross-checking and for patterns whose residual space is small.
+    Derivatives,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -173,6 +177,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
     let backend: &dyn RelationBackend = match cli.backend {
         BackendArg::Automata => &AutomataBackend,
         BackendArg::Minimized => &MinimizedBackend,
+        BackendArg::Derivatives => &DerivativeBackend,
     };
 
     let mut report = match command {

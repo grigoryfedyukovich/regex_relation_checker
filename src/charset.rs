@@ -18,7 +18,7 @@ impl Interval {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 pub struct CharSet {
     intervals: Vec<Interval>,
 }

@@ -167,16 +167,19 @@ Useful global options:
 
 ### 10.2 Backends
 
-`--backend` selects the analysis engine. Both implement the same documented
-regular subset and are expected to agree on every verdict and witness;
-`automata` (the default) does on-the-fly subset construction with a single
-product-BFS over both patterns at once. `minimized` determinizes and
+`--backend` selects the analysis engine. All three implement the same
+documented regular subset and are expected to agree on every verdict and
+witness; `automata` (the default) does on-the-fly subset construction with a
+single product-BFS over both patterns at once. `minimized` determinizes and
 minimizes each pattern's automaton first, then for `equivalent` checks
 isomorphism between the two minimized DFAs directly (no search needed when
 it holds); for `overlap`/`includes`, and for `equivalent` when the
 isomorphism check fails, it falls back to a product search over the
-minimized DFAs. Report JSON's `backend.name` field always records which one
-produced a given report (`"in_process_automata"` or `"minimized_dfa"`).
+minimized DFAs. `derivatives` compiles each pattern to a normalized residual
+expression and explores Brzozowski derivatives with a product BFS over
+residual pairs. Report JSON's `backend.name` field always records which one
+produced a given report (`"in_process_automata"`, `"minimized_dfa"`, or
+`"brzozowski_derivatives"`).
 
 ## 11. Configuration
 

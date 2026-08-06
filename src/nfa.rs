@@ -175,9 +175,23 @@ impl Builder {
             ExprKind::Alt(branches) => {
                 let start = self.state();
                 let end = self.state();
-                if branches.is_empty() {
-                    self.epsilon(start, end);
-                }
+                // An alternation with zero branches denotes the empty
+                // language (the identity element for union), matching
+                // `Reg::alt`'s treatment of an empty branch list in
+                // `derivative.rs` and the classic Kleene-algebra convention
+                // that a sum over an empty index set is the additive
+                // identity `∅`. Leaving `start`/`end` unconnected already
+                // encodes `∅` correctly here (the same pattern `transition`
+                // uses for an empty `CharSet`, just above), so there is
+                // nothing to add for this case: adding an epsilon edge would
+                // wrongly make the fragment accept `{ε}` instead.
+                //
+                // The parser never constructs `ExprKind::Alt(vec![])`
+                // (`parse_alt` always starts `branches` with one parsed
+                // element, and unwraps to that single branch instead of
+                // wrapping it in `Alt` when no `|` follows), so this only
+                // matters for `Expr` trees built directly through the
+                // public AST types rather than through `parse`.
                 for branch in branches {
                     let fragment = self.build(branch);
                     self.epsilon(start, fragment.start);
@@ -226,6 +240,7 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::Span;
     use crate::{parse, Alphabet, Config};
 
     fn compile(pattern: &str) -> Nfa {
@@ -265,6 +280,23 @@ mod tests {
     fn exact_zero_repeat_accepts_only_empty() {
         let nfa = compile("a{0}");
         assert!(nfa.matches(""));
+        assert!(!nfa.matches("a"));
+    }
+
+    #[test]
+    fn empty_alternation_denotes_the_empty_language() {
+        // `parse` can never produce `ExprKind::Alt(vec![])` -- `parse_alt`
+        // always seeds `branches` with one parsed element and unwraps to it
+        // directly instead of wrapping a lone branch in `Alt` -- so this
+        // constructs the AST node directly to cover callers who build
+        // `Expr` trees through the public AST types rather than the parser.
+        // An empty alternation is the identity element for union, so it
+        // must denote `∅` (matching nothing, not even the empty string) --
+        // see `derivative.rs`'s equivalent `empty_alternation_denotes_the_empty_language`
+        // test, which exercises the same AST node against `RegKind::Null`.
+        let expr = Expr::new(ExprKind::Alt(Vec::new()), Span::new(0, 0));
+        let nfa = Nfa::from_expr(&expr);
+        assert!(!nfa.matches(""));
         assert!(!nfa.matches("a"));
     }
 
