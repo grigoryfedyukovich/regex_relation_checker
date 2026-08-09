@@ -6,8 +6,8 @@ use regexrel::config::{Alphabet, Config};
 use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
-    analyze_binary_with_backend, analyze_empty_with_backend, AutomataBackend, DerivativeBackend,
-    MinimizedBackend, Query, RelationBackend,
+    analyze_binary_with_backend, analyze_empty_with_backend, AntimirovBackend, AutomataBackend,
+    DerivativeBackend, MinimizedBackend, Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -101,9 +101,14 @@ enum BackendArg {
     /// fall back to a product search over the minimized DFAs otherwise.
     Minimized,
     /// Brzozowski derivatives: residual expressions + product BFS over
-    /// normalized residual pairs. A third independent technique for
-    /// cross-checking and for patterns whose residual space is small.
+    /// normalized residual pairs. Independent technique for cross-checking
+    /// and for patterns whose residual space is small.
     Derivatives,
+    /// Antimirov partial derivatives: finite sets of residuals (linear
+    /// forms) + product BFS over form pairs. Same language theory as
+    /// Brzozowski, but the set representation maps more directly to NFA
+    /// states and can stay smaller under alternation.
+    Antimirov,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -318,6 +323,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         BackendArg::Automata => &AutomataBackend,
         BackendArg::Minimized => &MinimizedBackend,
         BackendArg::Derivatives => &DerivativeBackend,
+        BackendArg::Antimirov => &AntimirovBackend,
     };
 
     let mut report = match command {

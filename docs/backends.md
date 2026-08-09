@@ -1,7 +1,7 @@
 # Analysis backends
 
-`regexrel` implements three independent engines behind one CLI and library API.
-Select with `--backend <name>`. All three decide the same regular subset and
+`regexrel` implements four independent engines behind one CLI and library API.
+Select with `--backend <name>`. All four decide the same regular subset and
 must agree on every completed `YES` / `NO`. Disagreement is a bug; `UNKNOWN`
 means a resource limit was hit, not a soft “maybe”.
 
@@ -10,11 +10,13 @@ means a resource limit was hit, not a soft “maybe”.
 | `automata` (default) | `analysis.rs` | On-the-fly NFA subset construction + product BFS |
 | `minimized` | `minimize.rs` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
+| `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
 
-Cross-checking the three is intentional: a defect that is local to one
+Cross-checking all four is intentional: a defect that is local to one
 implementation is far more likely to surface as a backend disagreement than
 as a silent shared wrong answer. Integration tests in `tests/backend_agreement.rs`
-exercise this.
+exercise this across all four backends (`automata`, `minimized`, `derivatives`,
+`antimirov`) on every `cargo test` run.
 
 ---
 
@@ -122,6 +124,62 @@ the same atom; experiments comparing residual size to NFA subset size
 
 ---
 
+
+---
+
+## 4. `antimirov` — partial derivatives (linear forms)
+
+**Pipeline**
+
+1. Compile AST to the same residual algebra used by the Brzozowski backend
+   (normalized concat / alt / star, counted repeats expanded).
+2. Derive **Antimirov partial derivatives**: each character yields a *finite
+   set* of residuals (a linear form), not a single expression.
+   - `∂ₐ(E|F) = ∂ₐ(E) ∪ ∂ₐ(F)`
+   - `∂ₐ(EF) = ∂ₐ(E)·F ∪ (ν(E) ? ∂ₐ(F) : ∅)`
+   - `∂ₐ(E*) = ∂ₐ(E)·E*`
+3. Product BFS over pairs of linear forms. A form accepts when **any** member
+   is nullable.
+4. Empty linear form is the dead language on that side (same pruning rules as
+   other backends).
+
+**Why a fourth engine**
+
+Antimirov's construction builds an NFA whose states are residual expressions;
+the linear-form product is that idea applied to relation search. Under heavy
+alternation, a set of small residuals can be cheaper than one large Brzozowski
+term. Suffix-tracking languages such as `(a|b)*a(a|b){n}` remain exponential
+in `n` for all current engines.
+
+Concretely: `bench/yes/mega_equivalent__antimirov-block-position-{150,500}.md`
+compare `(((a|b|c*)?){N})*` (N concatenated copies of an optional-a /
+optional-b / any-run-of-c block, wrapped in an outer star) against the
+language-equivalent `(a|b|c)*`. The block count is language-irrelevant —
+the two sides are equivalent for any `N >= 1` — but not
+representation-irrelevant: `derivatives` must track *which of the N block
+positions* the current lap is in as part of one combined residual term, so
+its visited-state count grows like `Θ(N)`; `antimirov`'s linear form has no
+such positional bookkeeping and stays at a handful of states regardless of
+`N`. Both backends still return `YES`; the difference only shows up in
+`--stats` / `--json`, e.g.:
+
+```bash
+./bench/compare_antimirov.sh bench/yes/mega_equivalent__antimirov-block-position-150.md
+./bench/compare_antimirov.sh --backends "derivatives antimirov" \
+    equivalent '(((a|b|c*)?){500})*' '(a|b|c)*'
+```
+
+**When to use**
+
+Cross-checks against `derivatives` and `automata`; patterns with wide
+alternation where residual *sets* stay narrow; research comparisons on the
+`mega_*` suite.
+
+```bash
+./target/release/regexrel --backend antimirov --stats equivalent '(a|b)*' '(a*b*)*'
+./bench/run.sh --keep-going "--backend antimirov --max-states 1000000 --timeout-ms 60000"
+```
+
 ## Resource limits (all backends)
 
 | Config / flag | Meaning |
@@ -141,7 +199,8 @@ small / unknown shape     →  automata (default)
 equivalence of "same-ish" →  minimized
 star / optional chains    →  derivatives  (and compare)
 nth-from-end / windows    →  any may UNKNOWN; needs new methods
-agreement testing         →  run all three, require identical verdicts
+agreement testing         →  run all four, require identical verdicts
+wide alternation residuals→  antimirov (compare to derivatives)
 ```
 
 ```bash

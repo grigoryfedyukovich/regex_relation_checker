@@ -1,12 +1,18 @@
 //! Differential test between the `RelationBackend` implementations.
 //!
 //! This is the concrete payoff of keeping `AutomataBackend`,
-//! `MinimizedBackend`, and `DerivativeBackend` around side by side: if they ever disagree on a
-//! verdict or a witness for the same input, that's a real bug in one of
-//! them, caught automatically on every `cargo test` run rather than
-//! depending on someone noticing by hand. See `src/minimize.rs`'s module
-//! doc for why the two are different enough in technique for this to be a
-//! meaningful check rather than the same code path twice.
+//! `MinimizedBackend`, `DerivativeBackend`, and `AntimirovBackend` around
+//! side by side: if they ever disagree on a verdict or a witness for the
+//! same input, that's a real bug in one of them, caught automatically on
+//! every `cargo test` run rather than depending on someone noticing by
+//! hand. See `src/minimize.rs`'s module doc for why the two are different
+//! enough in technique for this to be a meaningful check rather than the
+//! same code path twice. `AntimirovBackend` shares its residual algebra
+//! with `DerivativeBackend` (same `Reg` shape, same normalization rules)
+//! but decides acceptance over *sets* of residuals instead of one combined
+//! residual, so a divergence between the two specifically implicates the
+//! linear-form/set bookkeeping (`LinearForm`, `partial_der`) rather than
+//! the shared algebra.
 //!
 //! The pattern generator here is deliberately a near-duplicate of the one in
 //! `tests/property.rs` rather than a shared helper -- each `tests/*.rs` file
@@ -16,8 +22,8 @@
 
 use proptest::prelude::*;
 use regexrel::{
-    analyze_binary_with_backend, analyze_empty_with_backend, AutomataBackend, Config,
-    DerivativeBackend, MinimizedBackend, Query,
+    analyze_binary_with_backend, analyze_empty_with_backend, AntimirovBackend, AutomataBackend,
+    Config, DerivativeBackend, MinimizedBackend, Query,
 };
 
 const LITERALS: [char; 3] = ['a', 'b', 'c'];
@@ -97,7 +103,8 @@ proptest! {
             let automata = analyze_binary_with_backend(query, &left, &right, &config, &AutomataBackend);
             let minimized = analyze_binary_with_backend(query, &left, &right, &config, &MinimizedBackend);
             let derivatives = analyze_binary_with_backend(query, &left, &right, &config, &DerivativeBackend);
-            if let (Ok(a), Ok(m), Ok(d)) = (automata, minimized, derivatives) {
+            let antimirov = analyze_binary_with_backend(query, &left, &right, &config, &AntimirovBackend);
+            if let (Ok(a), Ok(m), Ok(d), Ok(p)) = (automata, minimized, derivatives, antimirov) {
                 prop_assert_eq!(
                     a.verdict, m.verdict,
                     "{:?}({:?}, {:?}): automata={:?} minimized={:?}",
@@ -108,17 +115,28 @@ proptest! {
                     "{:?}({:?}, {:?}): automata={:?} derivatives={:?}",
                     query, left, right, a.verdict, d.verdict
                 );
+                prop_assert_eq!(
+                    a.verdict, p.verdict,
+                    "{:?}({:?}, {:?}): automata={:?} antimirov={:?}",
+                    query, left, right, a.verdict, p.verdict
+                );
                 let a_witness = a.witness.map(|w| w.value);
                 let m_witness = m.witness.map(|w| w.value);
                 let d_witness = d.witness.map(|w| w.value);
+                let p_witness = p.witness.map(|w| w.value);
                 prop_assert_eq!(
                     a_witness.clone(), m_witness,
                     "{:?}({:?}, {:?}): witnesses differ automata vs minimized",
                     query, left, right
                 );
                 prop_assert_eq!(
-                    a_witness, d_witness,
+                    a_witness.clone(), d_witness,
                     "{:?}({:?}, {:?}): witnesses differ automata vs derivatives",
+                    query, left, right
+                );
+                prop_assert_eq!(
+                    a_witness, p_witness,
+                    "{:?}({:?}, {:?}): witnesses differ automata vs antimirov",
                     query, left, right
                 );
             }
@@ -132,7 +150,8 @@ proptest! {
         let automata = analyze_empty_with_backend(&pattern, &config, &AutomataBackend);
         let minimized = analyze_empty_with_backend(&pattern, &config, &MinimizedBackend);
         let derivatives = analyze_empty_with_backend(&pattern, &config, &DerivativeBackend);
-        if let (Ok(a), Ok(m), Ok(d)) = (automata, minimized, derivatives) {
+        let antimirov = analyze_empty_with_backend(&pattern, &config, &AntimirovBackend);
+        if let (Ok(a), Ok(m), Ok(d), Ok(p)) = (automata, minimized, derivatives, antimirov) {
             prop_assert_eq!(
                 a.verdict, m.verdict,
                 "empty({:?}): automata={:?} minimized={:?}",
@@ -143,17 +162,28 @@ proptest! {
                 "empty({:?}): automata={:?} derivatives={:?}",
                 pattern, a.verdict, d.verdict
             );
+            prop_assert_eq!(
+                a.verdict, p.verdict,
+                "empty({:?}): automata={:?} antimirov={:?}",
+                pattern, a.verdict, p.verdict
+            );
             let a_witness = a.witness.map(|w| w.value);
             let m_witness = m.witness.map(|w| w.value);
             let d_witness = d.witness.map(|w| w.value);
+            let p_witness = p.witness.map(|w| w.value);
             prop_assert_eq!(
                 a_witness.clone(), m_witness,
                 "empty({:?}): witnesses differ automata vs minimized",
                 pattern
             );
             prop_assert_eq!(
-                a_witness, d_witness,
+                a_witness.clone(), d_witness,
                 "empty({:?}): witnesses differ automata vs derivatives",
+                pattern
+            );
+            prop_assert_eq!(
+                a_witness, p_witness,
+                "empty({:?}): witnesses differ automata vs antimirov",
                 pattern
             );
         }

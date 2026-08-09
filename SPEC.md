@@ -31,7 +31,7 @@ and configuration.
 
 ## 3. Analysis backends
 
-Three engines implement the same contract (`RelationBackend`). Select with
+Four engines implement the same contract (`RelationBackend`). Select with
 `--backend`. Completed `YES`/`NO` results must agree across backends; see
 [docs/backends.md](docs/backends.md).
 
@@ -57,7 +57,14 @@ sorted deduplicated alternations, flattened concatenations). Product BFS over
 pairs of residuals; nullability decides acceptance. Counted repetition is
 expanded before derivation.
 
-### 3.4 Limits
+### 3.4 `antimirov`
+
+Antimirov partial derivatives: each character produces a finite set of
+residuals (linear form). Product BFS over pairs of linear forms; a form
+accepts when any member is nullable. Language-equivalent residual theory to
+Brzozowski with a set-shaped state key.
+
+### 3.5 Limits
 
 `max_product_states` (`--max-states`) and `timeout_ms` (`--timeout-ms`) bound
 all backends. Exhausting either yields `UNKNOWN`.

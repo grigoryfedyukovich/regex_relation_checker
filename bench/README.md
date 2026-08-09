@@ -10,6 +10,17 @@
 ./bench/run.sh --keep-going "--backend derivatives --max-states 1000000 --timeout-ms 60000"
 ```
 
+- Cross-backend comparison, for a single query or benchmark file, showing
+  visited-state counts and timing side by side (see
+  [docs/backends.md](../docs/backends.md) for what this is useful for —
+  in particular, the `antimirov` vs `derivatives` state-count gap on
+  `mega_equivalent__antimirov-block-position-*.md`):
+
+```bash
+./bench/compare_antimirov.sh bench/yes/mega_equivalent__antimirov-block-position-150.md
+./bench/compare_antimirov.sh equivalent '(a|b|c)*' '(a|b|c)*'
+```
+
 ## Runner outcomes
 
 | Tag | Meaning |

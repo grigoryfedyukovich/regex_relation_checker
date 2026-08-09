@@ -5,13 +5,14 @@ regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
 a relation fails or overlap succeeds, it emits a **shortest** constructive
 witness.
 
-Three interchangeable analysis engines implement the same contract:
+Four interchangeable analysis engines implement the same contract:
 
 | `--backend` | Technique |
 |-------------|-----------|
 | `automata` (default) | On-the-fly NFA subset product BFS |
 | `minimized` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | Brzozowski residuals + residual-pair product |
+| `antimirov` | Antimirov partial derivatives (linear forms) + product BFS |
 
 Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
 state or time limit yields **`UNKNOWN`**, never a guessed verdict. Details:
@@ -61,10 +62,16 @@ Symbolic Brzozowski residuals with normalization. Often compact on star /
 optional / repeated-atom chains; still exponential on suffix-tracking languages
 such as `(a|b)*a(a|b){n}`.
 
+### `antimirov`
+
+Antimirov **partial** derivatives: each step yields a finite *set* of residuals
+(a linear form). Same residual language as Brzozowski, but the set form maps
+more directly to NFA states and can stay smaller under alternation.
+
 Compare engines on the same input:
 
 ```bash
-for b in automata minimized derivatives; do
+for b in automata minimized derivatives antimirov; do
   echo "== $b =="
   ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
 done

@@ -6,6 +6,7 @@
 //! uses full-string semantics. It never treats a bounded search as a proof.
 
 pub mod analysis;
+pub mod antimirov;
 pub mod ast;
 pub mod charset;
 pub mod config;
@@ -19,6 +20,7 @@ pub use analysis::{
     analyze_binary, analyze_binary_with_backend, analyze_empty, analyze_empty_with_backend,
     AnalyzeError, AutomataBackend, BackendResult, BackendStatus, Query, RelationBackend,
 };
+pub use antimirov::AntimirovBackend;
 pub use config::{Alphabet, Config};
 pub use derivative::DerivativeBackend;
 pub use minimize::MinimizedBackend;

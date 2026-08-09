@@ -12,7 +12,8 @@ Thompson NFA build          ─┐
 RelationBackend              │
   • automata  (default)      │
   • minimized                │
-  • derivatives ←────────────┘
+  • derivatives               │
+  • antimirov   ←────────────┘
     ↓
 Report (text or JSON) + optional shortest witness
 ```
@@ -28,6 +29,7 @@ Report (text or JSON) + optional shortest witness
 | `analysis` | `RelationBackend` trait, default **automata** product BFS, orchestration |
 | `minimize` | **minimized** backend: determinize, Moore minimize, isomorphism / DFA product |
 | `derivative` | **derivatives** backend: residual algebra + residual-pair product |
+| `antimirov` | **antimirov** backend: partial derivatives (linear forms) + product |
 | `config` | TOML + CLI overrides; validated limits |
 | `report` | Verdicts, witnesses, timings, JSON schema v1 |
 
