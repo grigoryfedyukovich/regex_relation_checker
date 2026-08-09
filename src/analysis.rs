@@ -284,6 +284,19 @@ fn search_product(query: Query, left: &Nfa, right: &Nfa, config: &Config) -> Bac
             right.outgoing_sets(&nodes[node_id].key.right),
         );
         for ch in representatives {
+            // Checked per transition, not just once per popped node: a
+            // single node can have a large fan-out (many representative
+            // characters, each potentially materializing a new state), and
+            // that whole batch would otherwise run to completion before the
+            // next opportunity to notice the deadline has passed.
+            if started.elapsed() >= deadline {
+                return stopped_result(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
             generated_transitions += 1;
             let next = ProductKey {
                 left: left.step(&nodes[node_id].key.left, ch),
@@ -358,6 +371,17 @@ fn search_single(nfa: &Nfa, config: &Config) -> BackendResult {
         let representatives =
             representative_chars(nfa.outgoing_sets(&nodes[node_id].key.0), std::iter::empty());
         for ch in representatives {
+            // See the matching comment in `search_product` above: checked
+            // per transition so a single high-fan-out node can't run past
+            // the deadline before the next check.
+            if started.elapsed() >= deadline {
+                return stopped_result(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
             generated_transitions += 1;
             let next = SubsetKey(nfa.step(&nodes[node_id].key.0, ch));
             if !visited.insert(next.clone()) {

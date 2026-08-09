@@ -447,6 +447,18 @@ fn search_product(query: Query, left: Reg, right: Reg, config: &Config) -> Backe
         let reps = representative_chars(&first);
 
         for ch in reps {
+            // Checked per transition, not just once per popped node: a
+            // single node can have a large fan-out, and that whole batch
+            // would otherwise run to completion before the next chance to
+            // notice the deadline has passed.
+            if started.elapsed() >= deadline {
+                return stopped_result(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
             generated_transitions += 1;
             let next_left = left_cache
                 .entry((nodes[node_id].key.left.clone(), ch))
@@ -544,6 +556,15 @@ fn search_single(reg: Reg, config: &Config) -> BackendResult {
         let mut first = Vec::new();
         nodes[node_id].key.0.first_sets(&mut first);
         for ch in representative_chars(&first) {
+            // See the matching comment in `search_product` above.
+            if started.elapsed() >= deadline {
+                return stopped_result(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
             generated_transitions += 1;
             let next_reg = cache
                 .entry((nodes[node_id].key.0.clone(), ch))

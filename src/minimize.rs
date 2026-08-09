@@ -27,6 +27,17 @@
 //! which is a stronger regression guard than either one alone -- a bug
 //! specific to one backend's implementation would very plausibly show up as
 //! a disagreement rather than being silently shared by both.
+//!
+//! Steps 1 and 2 (determinize, minimize) are bounded by both
+//! `--max-states` *and* `--timeout-ms`: earlier versions checked only the
+//! state cap during those two steps, so a slow determinization or
+//! minimization ran to completion no matter how small a timeout was
+//! requested -- the deadline only took effect once (if) the code reached
+//! the product-search fallback in step 4. `determinize`/`minimize` now take
+//! `started`/`deadline` and return `Result<_, BackendStatus>` so a timeout
+//! partway through either one is reported the same way a timeout anywhere
+//! else in this crate is: `BackendStatus::Timeout`, surfaced as
+//! `Verdict::Unknown`.
 
 use crate::analysis::{BackendResult, BackendStatus, Query, RelationBackend};
 use crate::charset::{CharSet, Interval};
@@ -124,8 +135,16 @@ fn alphabet_partition(sets: &[&CharSet]) -> Vec<(u32, u32, char)> {
 /// reachable NFA subset becomes one DFA state, bounded by `max_states`
 /// (reusing `config.max_product_states` as the same kind of resource limit
 /// `AutomataBackend` respects, just applied to determinization instead of
-/// the product search).
-fn determinize(nfa: &Nfa, max_states: usize) -> Result<Dfa, BackendStatus> {
+/// the product search) *and* by `deadline`. Unlike the product-search loops
+/// elsewhere in this crate, this used to have no time-based bound at all --
+/// only `max_states` -- so `--timeout-ms` had no effect until determinization
+/// finished or hit the state cap, however long that took.
+fn determinize(
+    nfa: &Nfa,
+    max_states: usize,
+    started: Instant,
+    deadline: Duration,
+) -> Result<Dfa, BackendStatus> {
     let mut states: Vec<DfaState> = vec![DfaState {
         accepting: false,
         transitions: Vec::new(),
@@ -154,9 +173,20 @@ fn determinize(nfa: &Nfa, max_states: usize) -> Result<Dfa, BackendStatus> {
     }
 
     while let Some(state_id) = queue.pop_front() {
+        if started.elapsed() >= deadline {
+            return Err(BackendStatus::Timeout);
+        }
         let subset = subsets[state_id].clone();
         let outgoing: Vec<&CharSet> = nfa.outgoing_sets(&subset).collect();
         for (start, end, rep) in alphabet_partition(&outgoing) {
+            // Checked per transition, not just once per popped state: a
+            // single state can partition into many distinct character
+            // ranges (especially with `--alphabet unicode`), and that whole
+            // batch would otherwise run to completion before the next
+            // chance to notice the deadline has passed.
+            if started.elapsed() >= deadline {
+                return Err(BackendStatus::Timeout);
+            }
             let next_subset = nfa.step(&subset, rep);
             let target = if next_subset.is_empty() {
                 DEAD
@@ -194,8 +224,11 @@ fn determinize(nfa: &Nfa, max_states: usize) -> Result<Dfa, BackendStatus> {
 /// Moore-style partition refinement: start with two classes (accepting /
 /// not), then repeatedly split any class whose members don't all transition
 /// into the *same* classes for every representative symbol, until nothing
-/// changes. What's left is the minimal DFA.
-fn minimize(dfa: &Dfa) -> Dfa {
+/// changes. What's left is the minimal DFA. Bounded by `deadline`: this used
+/// to run to completion unconditionally, ignoring `--timeout-ms` entirely,
+/// even though a full refinement pass touches every state on every
+/// iteration and iteration count itself scales with the DFA's size.
+fn minimize(dfa: &Dfa, started: Instant, deadline: Duration) -> Result<Dfa, BackendStatus> {
     let all_sets: Vec<&CharSet> = dfa
         .states
         .iter()
@@ -211,9 +244,20 @@ fn minimize(dfa: &Dfa) -> Dfa {
         .collect();
 
     loop {
+        if started.elapsed() >= deadline {
+            return Err(BackendStatus::Timeout);
+        }
         let mut signature_to_id: HashMap<(usize, Vec<usize>), usize> = HashMap::new();
         let mut new_partition = vec![0usize; n];
         for state_id in 0..n {
+            // A single refinement pass touches every state; on a large DFA
+            // that pass alone can take a while, so check periodically
+            // within it too rather than only once per outer iteration.
+            // (Not every state: `Instant::now()` is cheap but not free, and
+            // this inner loop is the hot path.)
+            if state_id % 4096 == 0 && started.elapsed() >= deadline {
+                return Err(BackendStatus::Timeout);
+            }
             let signature: Vec<usize> = reps
                 .iter()
                 .map(|&ch| partition[lookup_transition(dfa, state_id, ch)])
@@ -252,10 +296,10 @@ fn minimize(dfa: &Dfa) -> Dfa {
         });
     }
 
-    Dfa {
+    Ok(Dfa {
         states: new_states,
         start: partition[dfa.start],
-    }
+    })
 }
 
 /// Canonical BFS relabeling: assign state 0 to `start`, then explore
@@ -426,6 +470,18 @@ fn dfa_product_search(
             .collect();
         let combined: Vec<&CharSet> = l_sets.into_iter().chain(r_sets).collect();
         for ch in representative_symbols(&combined) {
+            // Checked per transition, not just once per popped node: a
+            // single node can have a large fan-out, and that whole batch
+            // would otherwise run to completion before the next chance to
+            // notice the deadline has passed.
+            if started.elapsed() >= deadline {
+                return timed_out(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
             generated_transitions += 1;
             let next_key = (
                 lookup_transition(left, l_id, ch),
@@ -518,6 +574,15 @@ fn dfa_search_single(dfa: &Dfa, config: &Config, started: Instant) -> BackendRes
             .map(|(set, _)| set)
             .collect();
         for ch in representative_symbols(&sets) {
+            // See the matching comment in `dfa_product_search` above.
+            if started.elapsed() >= deadline {
+                return timed_out(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
             generated_transitions += 1;
             let next = lookup_transition(dfa, state_id, ch);
             if !visited.insert(next) {
@@ -572,16 +637,37 @@ impl RelationBackend for MinimizedBackend {
         config: &Config,
     ) -> BackendResult {
         let started = Instant::now();
-        let left_dfa = match determinize(left, config.max_product_states) {
+        let deadline = Duration::from_millis(config.timeout_ms);
+        let left_dfa = match determinize(left, config.max_product_states, started, deadline) {
             Ok(dfa) => dfa,
             Err(status) => return timed_out(status, 0, 0, started),
         };
-        let right_dfa = match determinize(right, config.max_product_states) {
+        let right_dfa = match determinize(right, config.max_product_states, started, deadline) {
             Ok(dfa) => dfa,
             Err(status) => return timed_out(status, left_dfa.states.len(), 0, started),
         };
-        let left_min = minimize(&left_dfa);
-        let right_min = minimize(&right_dfa);
+        let left_min = match minimize(&left_dfa, started, deadline) {
+            Ok(dfa) => dfa,
+            Err(status) => {
+                return timed_out(
+                    status,
+                    left_dfa.states.len() + right_dfa.states.len(),
+                    0,
+                    started,
+                )
+            }
+        };
+        let right_min = match minimize(&right_dfa, started, deadline) {
+            Ok(dfa) => dfa,
+            Err(status) => {
+                return timed_out(
+                    status,
+                    left_min.states.len() + right_dfa.states.len(),
+                    0,
+                    started,
+                )
+            }
+        };
 
         if query == Query::Equivalent && dfas_isomorphic(&left_min, &right_min) {
             return BackendResult {
@@ -600,10 +686,14 @@ impl RelationBackend for MinimizedBackend {
 
     fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult {
         let started = Instant::now();
-        match determinize(nfa, config.max_product_states) {
+        let deadline = Duration::from_millis(config.timeout_ms);
+        match determinize(nfa, config.max_product_states, started, deadline) {
             Ok(dfa) => {
-                let minimized = minimize(&dfa);
-                dfa_search_single(&minimized, config, started)
+                let dfa_states = dfa.states.len();
+                match minimize(&dfa, started, deadline) {
+                    Ok(minimized) => dfa_search_single(&minimized, config, started),
+                    Err(status) => timed_out(status, dfa_states, 0, started),
+                }
             }
             Err(status) => timed_out(status, 0, 0, started),
         }
@@ -708,5 +798,36 @@ mod tests {
             analyze_binary_with_backend(Query::Equivalent, "a", "b", &config, &MinimizedBackend)
                 .unwrap();
         assert_eq!(report.verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn determinize_and_minimize_respect_timeout_not_just_state_limit() {
+        // Regression guard: `determinize` and `minimize` used to have no
+        // time-based bound at all -- only `max_states` -- so `--timeout-ms`
+        // had zero effect during those phases for `MinimizedBackend`; only
+        // the product-search fallback (or the isomorphism check) ever saw
+        // the deadline, and only once determinization/minimization had
+        // already run to completion or hit the state cap. A `deadline` of
+        // zero is already exhausted by the time it's first checked, so this
+        // is deterministic -- it doesn't depend on real elapsed wall-clock
+        // time being large enough to notice.
+        let config = Config::default();
+        let expr = crate::parser::parse("a+", &config).unwrap();
+        let nfa = crate::nfa::Nfa::from_expr(&expr);
+        let started = Instant::now();
+        let already_expired = Duration::from_millis(0);
+
+        assert!(matches!(
+            determinize(&nfa, config.max_product_states, started, already_expired),
+            Err(BackendStatus::Timeout)
+        ));
+
+        let real_deadline = Duration::from_millis(config.timeout_ms);
+        let dfa = determinize(&nfa, config.max_product_states, started, real_deadline)
+            .expect("determinize with a real deadline should succeed on a tiny pattern");
+        assert!(matches!(
+            minimize(&dfa, started, already_expired),
+            Err(BackendStatus::Timeout)
+        ));
     }
 }

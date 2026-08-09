@@ -122,13 +122,22 @@ impl Config {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_config(contents: &str) -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // A per-process atomic counter, not a timestamp: `cargo test`'s
+        // default runner starts most tests as threads within the same
+        // process within microseconds of each other, and on some platforms
+        // (notably macOS) `SystemTime::now()`'s actual clock resolution is
+        // coarser than a true nanosecond, so two threads calling this
+        // function close together could previously land on the same
+        // "nonce" and collide on the same file path -- one test's
+        // `write`/`remove_file` racing another's, mid-test. An atomic
+        // counter gives every call a distinct value by construction,
+        // independent of the OS clock, so this can't happen regardless of
+        // how tightly two calls land together in time.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "regexrel-config-{}-{nonce}.toml",
             std::process::id()
