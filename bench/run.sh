@@ -10,8 +10,13 @@
 #   ./bench/run.sh --keep-going "--backend minimized --max-states 20000"
 #
 # At most one extra argument (quote it) is word-split and passed to regexrel
-# before the benchmark file. The binary is taken from ./target/release/regexrel
-# when present; otherwise falls back to `cargo run --quiet --release --`.
+# before the benchmark file.
+#
+# Outcome classes:
+#   OK     — verdict matches the folder (YES/NO)
+#   LIMIT  — engine returned UNKNOWN (resource limit / timeout); theoretical
+#            answer is still the folder label — target for better algorithms
+#   FAIL   — wrong definite verdict, or tool crash / non-zero exit
 
 set -uo pipefail
 
@@ -45,6 +50,7 @@ if [[ ! -d "$YES_DIR" || ! -d "$NO_DIR" ]]; then
 fi
 
 FAILED=0
+LIMIT=0
 PASSED=0
 TOTAL=0
 
@@ -72,12 +78,20 @@ run_one() {
   first=$(printf '%s\n' "$out" | head -n1 | tr -d '\r')
 
   if [[ "$first" == "$expected" ]]; then
-    echo "OK    $file  -> $first"
+    echo "OK     $file  -> $first"
     PASSED=$((PASSED + 1))
+  elif [[ "$first" == "UNKNOWN" ]]; then
+    echo "LIMIT  $file  expected $expected, got UNKNOWN (resource limit — research target)"
+    echo "       detail:"
+    printf '%s\n' "$out" | sed 's/^/       /'
+    LIMIT=$((LIMIT + 1))
+    if [[ "$KEEP_GOING" -ne 1 ]]; then
+      exit 1
+    fi
   else
-    echo "FAIL  $file  expected $expected, got: $first"
-    echo "      full output:"
-    printf '%s\n' "$out" | sed 's/^/      /'
+    echo "FAIL   $file  expected $expected, got: $first"
+    echo "       full output:"
+    printf '%s\n' "$out" | sed 's/^/       /'
     FAILED=$((FAILED + 1))
     if [[ "$KEEP_GOING" -ne 1 ]]; then
       exit 1
@@ -105,10 +119,12 @@ for f in "$NO_DIR"/*.md; do
 done
 
 echo
-if [[ "$FAILED" -eq 0 ]]; then
-  echo "All $TOTAL benchmarks passed ($PASSED OK)."
+echo "Summary: $PASSED OK, $LIMIT LIMIT (UNKNOWN), $FAILED FAIL  (total $TOTAL)"
+if [[ "$FAILED" -eq 0 && "$LIMIT" -eq 0 ]]; then
   exit 0
+elif [[ "$FAILED" -eq 0 ]]; then
+  # Only resource limits — distinct exit code for CI / research tracking
+  exit 3
 else
-  echo "$FAILED of $TOTAL benchmarks failed ($PASSED passed)."
   exit 1
 fi

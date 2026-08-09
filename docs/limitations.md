@@ -1,4 +1,13 @@
-# Limitations and issue boundary
+# Limitations
+
+## Backends
+
+All three engines (`automata`, `minimized`, `derivatives`) decide the same
+regular subset. They may hit `max_product_states` or `timeout_ms` on different
+inputs; a completed `YES`/`NO` from any backend is exact. Suffix-tracking
+patterns such as `(a|b)*a(a|b){n}` can exhaust practical limits on every
+current engine — see `bench/README.md` and `docs/backends.md`.
+
 
 ## Correctness work
 

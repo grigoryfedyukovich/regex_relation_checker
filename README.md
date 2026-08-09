@@ -1,8 +1,21 @@
 # regex-relation-checker
 
-`regexrel` decides exact language relations for a documented regular-expression subset. It can check emptiness, overlap, left-to-right inclusion, and equivalence, and it emits a shortest witness whenever a relation fails or overlap succeeds.
+`regexrel` decides **exact** full-string language relations for a documented
+regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
+a relation fails or overlap succeeds, it emits a **shortest** constructive
+witness.
 
-The implementation is intentionally small and auditable: a hand-written frontend lowers regexes to a language-neutral AST, Thompson construction produces epsilon-NFAs, and an on-the-fly subset/product BFS searches the exact finite automata state space. Optional backends include minimized DFAs (`--backend minimized`) and Brzozowski derivatives (`--backend derivatives`). Resource exhaustion yields `UNKNOWN`, never a guessed answer.
+Three interchangeable analysis engines implement the same contract:
+
+| `--backend` | Technique |
+|-------------|-----------|
+| `automata` (default) | On-the-fly NFA subset product BFS |
+| `minimized` | Determinize → minimize → isomorphism or DFA product |
+| `derivatives` | Brzozowski residuals + residual-pair product |
+
+Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
+state or time limit yields **`UNKNOWN`**, never a guessed verdict. Details:
+[docs/backends.md](docs/backends.md), [SPEC.md](SPEC.md).
 
 ## Two-minute demo
 
@@ -21,81 +34,112 @@ cargo build --release
 # YES
 ```
 
-Other queries:
-
 ```bash
 regexrel empty 'a|b'
 regexrel syntax
 regexrel --json equivalent '^a+$' 'aa*'
-regexrel --stats --max-states 50000 overlap 'a.*z' 'ab+z'
+regexrel --stats --backend minimized --max-states 50000 overlap 'a.*z' 'ab+z'
+regexrel --backend derivatives equivalent 'a*a*a*' 'a*'
 ```
+
+## Analysis engines
+
+### `automata` (default)
+
+Thompson ε-NFAs and a single on-the-fly product BFS over subset pairs. No
+upfront determinization cost. Strong default for small and medium patterns.
+
+### `minimized`
+
+Fully determinizes and minimizes each side. **Equivalence** can finish via
+minimal-DFA isomorphism without a product search; other queries (and
+non-isomorphic equivalence) product-search the minimized DFAs.
+
+### `derivatives`
+
+Symbolic Brzozowski residuals with normalization. Often compact on star /
+optional / repeated-atom chains; still exponential on suffix-tracking languages
+such as `(a|b)*a(a|b){n}`.
+
+Compare engines on the same input:
+
+```bash
+for b in automata minimized derivatives; do
+  echo "== $b =="
+  ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
+done
+```
+
+Full write-up: **[docs/backends.md](docs/backends.md)**.
 
 ## Benchmark files
 
-When the last CLI argument is an existing readable file (and is not a reserved
-subcommand name), the file is treated as a **benchmark**:
+If the last CLI argument is an existing readable file (and not a reserved
+subcommand name), it is treated as a **benchmark**:
 
-1. Lines whose first non-blank character is `#` are dropped (comments and
-   markdown headers).
-2. The remaining text is shell-tokenized (whitespace-separated tokens, with
-   `'single'` and `"double"` quoting; double quotes also recognize `\"` and
-   `\\`).
-3. Those tokens become the real CLI arguments, after any preceding flags.
-
-Example file `bench.md`:
-
-```text
-# overlap: a+b vs ab+
-overlap 'a+b' 'ab+'
-```
+1. Drop lines whose first non-blank character is `#`.
+2. Shell-tokenize the rest (`'` and `"` quoting).
+3. Use those tokens as the CLI arguments after any preceding flags.
 
 ```bash
-regexrel bench.md
-# YES
-# shortest witness: "ab"
-
-regexrel --backend derivatives bench.md
+regexrel --backend derivatives bench/yes/equivalent__a-or-a_vs_a.md
 ```
 
-The `bench/yes/` and `bench/no/` directories contain such files. A helper
-script `./bench/run.sh` (run from the project root after a release
-build) executes every file and checks that the first output line is `YES`
-or `NO` according to the folder. Optional `--keep-going` and one extra
-quoted argument (forwarded to `regexrel`) are supported:
+### Suite layout (`bench/`)
+
+| Path | Expected first line |
+|------|---------------------|
+| `bench/yes/*.md` | `YES` |
+| `bench/no/*.md` | `NO` |
+
+Prefixes: plain smoke tests; `heavy_` / `stress_` larger counts; `mega_`
+hundreds of quantifiers or **exponential / window** languages (research
+targets that may hit `UNKNOWN` under default limits).
+
+Runner (from repo root):
 
 ```bash
 ./bench/run.sh
 ./bench/run.sh --keep-going
-./bench/run.sh "--backend derivatives"
-./bench/run.sh --keep-going "--backend minimized --max-states 20000"
+./bench/run.sh --keep-going "--backend minimized --max-states 1000000 --timeout-ms 60000"
 ```
+
+Outcomes: **OK** (verdict matches), **LIMIT** (`UNKNOWN` — resource bound),
+**FAIL** (wrong definite verdict or crash). See [bench/README.md](bench/README.md).
 
 ## Semantics
 
-Matching is **full-string matching**. Therefore `a` denotes exactly the one-character string `"a"`, not a substring search. Outer `^` and `$` are accepted as explicit documentation of the same semantics; anchors elsewhere are unsupported.
+Matching is **full-string** only: `a` is the language `{"a"}`, not a substring
+search. Outer `^` / `$` are accepted as documentation of that boundary; anchors
+elsewhere are unsupported.
 
-Witnesses are generated by breadth-first search and are shortest by Unicode scalar/codepoint count. Ties are broken deterministically by the lowest scalar value available in each symbolic transition class.
+Default alphabet: ASCII `U+0000..U+007F`. `--alphabet unicode` uses Unicode
+scalars excluding surrogates. In v0.1.x, `\d` `\w` `\s` stay ASCII-defined in
+both modes.
 
-The default alphabet is ASCII (`U+0000..U+007F`). `--alphabet unicode` expands literals, dot, and negated classes to Unicode scalar values, excluding surrogates. In v0.1.1, `\d`, `\w`, and `\s` remain ASCII-defined in both modes.
+Witnesses are shortest by codepoint count; ties use the lowest scalar in each
+symbolic transition class.
 
-See [SPEC.md](SPEC.md) for the complete functional contract and [docs/semantics.md](docs/semantics.md) for the language semantics. For a command-by-command walkthrough, CI recipes, JSON automation, and library examples, read the [full tutorial](docs/tutorial.md).
+See [docs/semantics.md](docs/semantics.md) and [SPEC.md](SPEC.md).
 
 ## Supported subset
 
-- literals and escaped metacharacters
-- concatenation and `a|b`
-- plain groups `( ... )`
-- `.`, with configurable newline behavior
-- classes such as `[abc]`, `[a-z]`, and `[^0-9]`
-- `\n`, `\r`, `\t`, `\0`, `\d`, `\D`, `\w`, `\W`, `\s`, `\S`
-- `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}`
-- optional outer `^` and `$`
+- literals and escaped metacharacters  
+- concatenation and `a|b`  
+- groups `(...)`  
+- `.` (newline configurable)  
+- classes `[abc]`, `[a-z]`, `[^...]`  
+- `\n` `\r` `\t` `\0` `\d` `\D` `\w` `\W` `\s` `\S`  
+- `*` `+` `?` `{m}` `{m,}` `{m,n}`  
+- optional outer `^` and `$`  
 
-Not supported: backreferences, lookaround, inline flags, lazy/possessive quantifiers, Unicode property escapes, word boundaries, conditionals, or full PCRE capture semantics. Run `regexrel syntax` for the installed tool's syntax contract.
+Not supported: backreferences, lookaround, inline flags, lazy/possessive
+suffixes, Unicode properties, word boundaries, conditionals.  
+`regexrel syntax` prints the installed contract.
 
 ## Configuration
 
-`regexrel` reads `./regexrel.toml` when present, or a file named with `--config`. The file is deserialized, CLI flags override its values, and the effective configuration is then validated. This ordering allows a CLI override to repair an invalid file value. Unknown keys are errors.
+`./regexrel.toml` or `--config PATH`. CLI overrides then validation.
 
 ```toml
 alphabet = "ascii"
@@ -106,16 +150,15 @@ dot_matches_newline = false
 ci_exit_code = 10
 ```
 
-Print the effective configuration with:
-
 ```bash
 regexrel --print-config
-regexrel --config examples/regexrel.toml --print-config overlap a a
+regexrel --max-states 1000000 --timeout-ms 60000 --backend derivatives ...
 ```
 
-## Exit codes and CI policy
+## Exit codes and CI
 
-A completed analysis exits `0` even when the semantic answer is `NO`. Invalid configuration or syntax exits `2`; internal invariant failures exit `3`. CI can convert selected verdicts into a configured nonzero code:
+Completed analysis exits `0` even when the verdict is `NO`. Invalid input or
+config exits `2`; internal failures exit `3`.
 
 ```bash
 regexrel --fail-on no --ci-exit-code 17 equivalent 'a|b' '[ab]'
@@ -123,27 +166,15 @@ regexrel --fail-on unknown overlap "$LEFT" "$RIGHT"
 regexrel --fail-on non-yes includes "$OLD" "$NEW"
 ```
 
-`UNSUPPORTED` is treated like `UNKNOWN` by `--fail-on unknown`.
-
-## JSON output
+## JSON
 
 ```bash
 regexrel --json includes '[a-z]+' '[a-z]{2,}'
 ```
 
-The report contains:
+Schema v1: [docs/json-schema-v1.md](docs/json-schema-v1.md).
 
-- schema, tool, and backend versions
-- query and verdict
-- shortest witness and relation, when present
-- stable diagnostic identifier
-- assumptions and resource limits
-- NFA/product statistics and phase timings whose `total_ms` equals all reported components
-- semantic mode
-
-The v1 schema is documented in [docs/json-schema-v1.md](docs/json-schema-v1.md).
-
-## Library API
+## Library
 
 ```rust
 use regexrel::{analyze_binary, Config, Query, Verdict};
@@ -158,25 +189,33 @@ assert_eq!(report.verdict, Verdict::Yes);
 # Ok::<(), regexrel::AnalyzeError>(())
 ```
 
-## Correctness boundary
-
-A `YES` or `NO` result is exact for the supported syntax and selected alphabet. The search is not depth-bounded. `max_product_states` and `timeout_ms` are operational limits: if either is reached before the reachable product is exhausted, the answer is `UNKNOWN` and the report includes the consumed resources.
-
-Every emitted witness is replayed independently through both NFAs before it is returned. A replay mismatch is an internal error, not a user verdict.
-
 ## Development
 
 ```bash
-cargo clippy --all-targets --all-features
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+./check.sh          # local mirror of CI steps
+./bench/run.sh --keep-going
 ```
 
-CI runs on Linux and macOS. Unit tests cover parser success and failure boundaries, interval algebra, Thompson construction, concrete differential checks, algebraic relation laws, resource limits, backend isolation, and witness replay. Integration tests cover CLI rendering, golden output, Unicode and dot modes, TOML precedence, JSON structure, exit codes, CI policy, and a route/identifier corpus.
+## Documentation map
 
-Run the executable tutorial with `examples/tutorial.sh`, or read [docs/tutorial.md](docs/tutorial.md). The v0.1 audit and v0.1.1 resolution status are recorded in [docs/audit-resolution.md](docs/audit-resolution.md).
+| Document | Topic |
+|----------|--------|
+| [SPEC.md](SPEC.md) | Functional contract |
+| [docs/backends.md](docs/backends.md) | Engines in depth |
+| [docs/architecture.md](docs/architecture.md) | Module layout |
+| [docs/semantics.md](docs/semantics.md) | Language model |
+| [docs/limitations.md](docs/limitations.md) | Known bounds |
+| [docs/json-schema-v1.md](docs/json-schema-v1.md) | JSON schema v1 |
+| [bench/README.md](bench/README.md) | Benchmark suite |
 
 ## Limitations
 
-The tool models regular languages, not engine-specific backtracking or capture behavior. It does not detect catastrophic backtracking. Unicode shorthand and case-folding semantics are intentionally incomplete. Large counted repetitions are expanded into NFA fragments and limited by `max_repeat`.
+Models regular languages only — not engine-specific backtracking or captures.
+Unicode shorthands and case-folding are intentionally incomplete. Large counted
+repetitions expand under `max_repeat`. Hard suffix-tracking benchmarks may
+return `UNKNOWN` until stronger algorithms are implemented.
 
-See [docs/limitations.md](docs/limitations.md) for the issue boundary and planned extensions.
+See [docs/limitations.md](docs/limitations.md).

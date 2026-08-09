@@ -1,2 +1,2 @@
-# equivalent: (a|b)*a(a|b){20} vs itself (DFA size ~2^21)
+# equivalent: (a|b)*a(a|b){20} vs same — Θ(2^20) residual/DFA; engines may UNKNOWN under default limits
 equivalent '(a|b)*a(a|b){20}' '(a|b)*a(a|b){20}'

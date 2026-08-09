@@ -1,76 +1,60 @@
 # Architecture
 
-## Pipeline
+## Layers
 
 ```text
-regex text
-   │
-   ▼
-hand-written parser ── spans/diagnostics
-   │
-   ▼
-language-neutral AST
-   │
-   ▼
-Thompson NFA builder
-   │
-   ▼
-on-the-fly epsilon-closure subsets
-   │
-   ▼
-product BFS + predecessor tree
-   │
-   ├── exact verdict
-   ├── shortest witness
-   └── resource statistics
+CLI / library API
+    ↓
+parser (hand-written) → AST
+    ↓
+Thompson NFA build          ─┐
+    ↓                        │  derivatives also consume AST
+RelationBackend              │
+  • automata  (default)      │
+  • minimized                │
+  • derivatives ←────────────┘
+    ↓
+Report (text or JSON) + optional shortest witness
 ```
 
-## Frontend boundary
+## Modules
 
-`parser.rs` owns source syntax, byte spans, recovery hints, and unsupported-feature classification. It emits `ast::Expr`, whose nodes contain only semantic constructors and source spans. Analysis never depends on parser cursor state or source-node identity.
+| Module | Role |
+|--------|------|
+| `parser` | Supported subset → `Expr` AST; syntax help via `regexrel syntax` |
+| `ast` | Language-neutral expression tree |
+| `charset` | Interval sets for classes, partitions, complements |
+| `nfa` | Thompson ε-NFA construction and helpers |
+| `analysis` | `RelationBackend` trait, default **automata** product BFS, orchestration |
+| `minimize` | **minimized** backend: determinize, Moore minimize, isomorphism / DFA product |
+| `derivative` | **derivatives** backend: residual algebra + residual-pair product |
+| `config` | TOML + CLI overrides; validated limits |
+| `report` | Verdicts, witnesses, timings, JSON schema v1 |
 
-## Character representation
+## Backend contract
 
-`charset.rs` represents labels as normalized, disjoint inclusive scalar intervals. Membership uses binary search, and union linearly merges two already-normalized lists. Intersection, subtraction, complement, and alphabet clipping preserve deterministic interval order. Static slices represent the ASCII and Unicode scalar universes.
+Every backend returns a `BackendResult` with status (`Found`, `Exhausted`,
+`StateLimit`, `Timeout`), optional witness, and counters. The orchestration
+layer maps that into a user-facing `Verdict` (`YES` / `NO` / `UNKNOWN` /
+`UNSUPPORTED`), validates witnesses by independent replay, and fills timings.
 
-## NFA construction
+AST-aware entry points (`analyze_binary_expr` / `analyze_empty_expr`) let the
+derivatives backend avoid a pure-NFA path; other backends ignore the AST and
+use the NFAs.
 
-`nfa.rs` uses Thompson fragments with one start and one end state. Counted repetition is expanded up to the configured `max_repeat`. Anchors and the empty expression compile to epsilon fragments.
+## Determinism
 
-## On-the-fly determinization
-
-A DFA state is a sorted, duplicate-free vector of NFA state identifiers closed under epsilon transitions. Dense visitation tables compute transition targets and epsilon closure without tree-set allocation. DFA transitions are computed only for reachable subsets. The complete DFA is never materialized ahead of the query.
-
-## Product search
-
-Binary relations use a product key `(left_subset, right_subset)`. At each key, outgoing NFA interval endpoints from both sides induce symbolic character partitions. One lowest-scalar representative per partition is sufficient because both subset transitions are constant inside that partition.
-
-BFS target predicates are:
-
-- overlap: `left_accepting ∧ right_accepting`
-- inclusion counterexample: `left_accepting ∧ ¬right_accepting`
-- equivalence counterexample: `left_accepting XOR right_accepting`
-
-Emptiness runs the same BFS idea over a unary `SubsetKey`; it does not allocate a meaningless right-hand subset. Timeout checks occur at BFS-state granularity.
-
-Each discovered node stores one predecessor and character. Reconstructing that chain produces a shortest witness. The witness is then replayed against the NFAs as an independent internal check.
-
-## Backend boundary
-
-The default backend is an in-process exact automata backend. No solver or subprocess is used. The public `RelationBackend` trait accepts compiled NFAs and returns evidence plus statistics; `analyze_*_with_backend` keeps report assembly and witness replay outside the backend. AST-aware backends (Brzozowski derivatives) override `analyze_*_expr` entry points so residual expressions can be derived without reconstructing the AST from an NFA. Tests include deterministic fake backends and multi-backend differential agreement checks to verify this boundary.
-
-## Caching
-
-v0.1.1 performs no persistent caching. This deliberately avoids stale semantic artifacts. A future cache must key entries by tool semantic version, pattern digest, complete configuration digest, query, and backend mode.
+- Alphabet partitions are split at every relevant interval endpoint.
+- The lowest Unicode scalar in each partition is explored first.
+- Witnesses are shortest by codepoint count under that policy.
 
 ## Failure modes
 
-- syntax/configuration error: process exit `2`
-- internal invariant/replay error: process exit `3`
-- unsupported semantics: report verdict `UNSUPPORTED`
-- state or timeout exhaustion: report verdict `UNKNOWN`
-- CI policy failure: configured nonzero exit code
+| Situation | Verdict / exit |
+|-----------|----------------|
+| Unsupported syntax | `UNSUPPORTED` / input error |
+| State or time limit | `UNKNOWN` |
+| Completed search | `YES` or `NO` (exit 0 unless `--fail-on`) |
+| Witness replay mismatch | internal error |
 
-## Report rendering
-
-Text output is built once with a timing placeholder and finalized in place. JSON is serialized once and its `rendering_ms` and `total_ms` numeric fields are finalized in place. This avoids the former double-render path while preserving self-reported timing.
+Details: [backends.md](backends.md), [semantics.md](semantics.md), [../SPEC.md](../SPEC.md).
