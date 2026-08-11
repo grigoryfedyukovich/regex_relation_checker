@@ -6,8 +6,8 @@ use regexrel::config::{Alphabet, Config};
 use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
-    analyze_binary_with_backend, analyze_empty_with_backend, AntimirovBackend, AutomataBackend,
-    DerivativeBackend, MinimizedBackend, Query, RelationBackend,
+    analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
+    AntimirovBackend, AutomataBackend, DerivativeBackend, MinimizedBackend, Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,7 +32,7 @@ after any preceding flags. Examples:\n\n\
 where the file contains e.g.\n\n\
     # overlap: a+b vs ab+\n\
     overlap 'a+b' 'ab+'\n\n\
-Subcommand names (empty, overlap, includes, equivalent, syntax) are never \
+Subcommand names (empty, match, overlap, includes, equivalent, syntax) are never \
 interpreted as benchmark paths."
 )]
 struct Cli {
@@ -139,6 +139,8 @@ enum FailOn {
 enum Command {
     /// Decide whether a regex language is empty.
     Empty { regex: String },
+    /// Decide whether a concrete string belongs to a regex language.
+    Match { regex: String, input: String },
     /// Decide whether the two regex languages have a common string.
     Overlap { left: String, right: String },
     /// Decide whether every left-language string is in the right language.
@@ -155,8 +157,14 @@ enum Command {
 /// this keeps `regexrel equivalent` (missing its required arguments) failing
 /// with clap's normal "missing required argument" message instead of
 /// silently taking a different code path.
-const RESERVED_SUBCOMMAND_NAMES: [&str; 5] =
-    ["empty", "overlap", "includes", "equivalent", "syntax"];
+const RESERVED_SUBCOMMAND_NAMES: [&str; 6] = [
+    "empty",
+    "match",
+    "overlap",
+    "includes",
+    "equivalent",
+    "syntax",
+];
 
 /// If the last argument names an existing, readable file (and is not a
 /// reserved subcommand name), treat that file as a benchmark: strip any line
@@ -328,6 +336,9 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
 
     let mut report = match command {
         Command::Empty { regex } => analyze_empty_with_backend(&regex, &config, backend),
+        Command::Match { regex, input } => {
+            analyze_match_with_backend(&regex, &input, &config, backend)
+        }
         Command::Overlap { left, right } => {
             analyze_binary_with_backend(Query::Overlap, &left, &right, &config, backend)
         }
@@ -496,10 +507,21 @@ fn render_text(report: &Report, show_stats: bool) -> String {
                 other => format!("distinguishing witness ({other}): {escaped}"),
             },
             Query::Empty => format!("witness in language: {escaped}"),
+            Query::Match => format!("matched input: {escaped}"),
         };
         lines.push(line);
     }
-    if matches!(report.verdict, Verdict::Unknown | Verdict::Unsupported) {
+    // `Query::Match`'s "No" case has no witness to show (there's nothing to
+    // construct -- the "witness" would just be the input the caller already
+    // typed), so it's the one non-Unknown/Unsupported verdict that still
+    // carries diagnostic detail worth surfacing: `report_from_match_outcome`
+    // sets both `diagnostic.message` ("input does not belong to the
+    // language") and `diagnostic.input` (the tested string) for exactly
+    // this case. Show them here alongside the usual Unknown/Unsupported
+    // diagnostics, or they're computed and then never seen.
+    let show_diagnostic = matches!(report.verdict, Verdict::Unknown | Verdict::Unsupported)
+        || (report.query == Query::Match && report.verdict == Verdict::No);
+    if show_diagnostic {
         lines.push(format!("reason: {}", report.diagnostic.message));
         if let Some(input) = &report.diagnostic.input {
             lines.push(format!("input: {input}"));

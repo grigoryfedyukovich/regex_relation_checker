@@ -341,7 +341,7 @@ fn is_dead_end(query: Query, left: &Reg, right: &Reg) -> bool {
         // takes the unary `search_single` path instead and never reaches
         // here. `false` (never prune) is the conservative, always-safe
         // answer for a query this function isn't actually asked about.
-        Query::Empty => false,
+        Query::Empty | Query::Match => false,
     }
 }
 
@@ -662,6 +662,144 @@ impl RelationBackend for DerivativeBackend {
     fn analyze_empty_expr(&self, expr: &Expr, _nfa: &Nfa, config: &Config) -> BackendResult {
         search_single(from_expr(expr), config)
     }
+
+    fn match_input(&self, expr: &Expr, _nfa: &Nfa, input: &str, config: &Config) -> BackendResult {
+        match_brzozowski(expr, input, config)
+    }
+}
+
+/// Walk one concrete string under Brzozowski derivation with memoization.
+///
+/// A tiny lazily-built DFA over `Reg` residual states, keyed by small
+/// integer ids rather than by the residuals themselves.
+///
+/// `match_brzozowski` used to cache transitions as `HashMap<(Reg, char),
+/// Reg>`: that avoids *recomputing* an already-seen transition, but every
+/// lookup still has to *hash* the current `Reg` to find it -- and hashing a
+/// `Reg` costs O(residual size), because `Rc<RegKind>: Hash` hashes the
+/// pointed-to tree, not the pointer. For patterns whose distinct-residual
+/// *count* stays small but whose individual residual *terms* stay large
+/// (wide alternation wrapped in an outer repetition is the common shape --
+/// see `docs/backends.md`'s antimirov section for why), that made every
+/// step of a long match walk pay a cost proportional to term size, even on
+/// a cache hit.
+///
+/// Interning pays that hashing cost once per *distinct* residual, the
+/// first time it's seen; every revisit after that is a
+/// `(usize, char) -> usize` lookup, cheap regardless of how large the
+/// underlying residual is. This is the same "lazy DFA" technique real
+/// derivative-based regex engines use to make repeated/long matching fast
+/// without a separate upfront determinization pass.
+struct ResidualInterner {
+    ids: HashMap<Reg, usize>,
+    states: Vec<Reg>,
+}
+
+impl ResidualInterner {
+    fn new(start: Reg) -> Self {
+        let mut ids = HashMap::new();
+        ids.insert(start.clone(), 0);
+        Self {
+            ids,
+            states: vec![start],
+        }
+    }
+
+    /// The id for `state`, assigning a new one if it's not already known
+    /// and there's room under `max_states`. Only returns `None` when
+    /// `state` is genuinely new *and* the limit is already reached --
+    /// revisiting an already-known state never fails, even exactly at the
+    /// limit, since it doesn't grow the state count.
+    fn intern(&mut self, state: Reg, max_states: usize) -> Option<usize> {
+        if let Some(&id) = self.ids.get(&state) {
+            return Some(id);
+        }
+        if self.states.len() >= max_states {
+            return None;
+        }
+        let id = self.states.len();
+        self.states.push(state.clone());
+        self.ids.insert(state, id);
+        Some(id)
+    }
+}
+
+/// Only residuals actually visited by `input` are computed — the classic
+/// derivative advantage over building a full automaton for membership.
+fn match_brzozowski(expr: &Expr, input: &str, config: &Config) -> BackendResult {
+    let started = Instant::now();
+    let deadline = Duration::from_millis(config.timeout_ms);
+    let mut interner = ResidualInterner::new(from_expr(expr));
+    let mut transitions: HashMap<(usize, char), usize> = HashMap::new();
+    let mut current = 0usize;
+    let mut generated = 0usize;
+
+    for ch in input.chars() {
+        if started.elapsed() >= deadline {
+            return BackendResult {
+                status: BackendStatus::Timeout,
+                witness: None,
+                relation: None,
+                visited_states: interner.states.len(),
+                generated_transitions: generated,
+                analysis_ms: started.elapsed().as_millis(),
+                witness_extraction_ms: 0,
+            };
+        }
+        generated += 1;
+        let next = match transitions.get(&(current, ch)) {
+            Some(&id) => id,
+            None => {
+                let next_reg = interner.states[current].derivative(ch);
+                match interner.intern(next_reg, config.max_product_states) {
+                    Some(id) => {
+                        transitions.insert((current, ch), id);
+                        id
+                    }
+                    None => {
+                        return BackendResult {
+                            status: BackendStatus::StateLimit,
+                            witness: None,
+                            relation: None,
+                            visited_states: interner.states.len(),
+                            generated_transitions: generated,
+                            analysis_ms: started.elapsed().as_millis(),
+                            witness_extraction_ms: 0,
+                        };
+                    }
+                }
+            }
+        };
+        current = next;
+        // Empty residual: no continuation can accept.
+        if matches!(interner.states[current].0.as_ref(), RegKind::Null) {
+            break;
+        }
+    }
+
+    let analysis_ms = started.elapsed().as_millis();
+    let reg = &interner.states[current];
+    if reg.nullable() {
+        BackendResult {
+            status: BackendStatus::Found,
+            witness: Some(input.to_owned()),
+            relation: Some(relation::IN_LANGUAGE.to_owned()),
+            visited_states: interner.states.len(),
+            generated_transitions: generated,
+            analysis_ms,
+            witness_extraction_ms: 0,
+        }
+    } else {
+        BackendResult {
+            status: BackendStatus::Exhausted,
+            witness: None,
+            relation: None,
+            visited_states: interner.states.len(),
+            generated_transitions: generated,
+            analysis_ms,
+            witness_extraction_ms: 0,
+        }
+    }
 }
 
 // Silence unused Hasher import when Hash is derived only.
@@ -676,7 +814,8 @@ fn _hash_reg(r: &Reg) -> u64 {
 mod tests {
     use super::*;
     use crate::analysis::{
-        analyze_binary_with_backend, analyze_empty_with_backend, AutomataBackend,
+        analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
+        AutomataBackend,
     };
     use crate::report::Verdict;
     use crate::{parse, Config};
@@ -953,6 +1092,57 @@ mod tests {
         let report =
             analyze_binary_with_backend(Query::Equivalent, "a+", "b+", &config, &DerivativeBackend)
                 .unwrap();
+        assert_eq!(report.verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn match_walk_revisiting_a_known_state_survives_a_tight_state_limit() {
+        // Regression guard for `ResidualInterner::intern`: revisiting an
+        // already-known residual must never count as hitting
+        // `max_product_states`, only genuinely *new* ones may. `a*`'s
+        // derivative w.r.t. 'a' is `a*` itself -- a self-loop, exactly one
+        // distinct residual for the whole walk -- so with
+        // `max_product_states: 1`, matching a long run of 'a's against
+        // `a*` must still succeed.
+        let config = Config {
+            max_product_states: 1,
+            ..Config::default()
+        };
+        let report =
+            analyze_match_with_backend("a*", &"a".repeat(50), &config, &DerivativeBackend).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+    }
+
+    #[test]
+    fn match_walk_cycling_between_two_known_states_survives_a_tight_state_limit() {
+        // Same guard as above, but for a walk that cycles between *two*
+        // distinct residuals rather than self-looping on one: `(ab)*`
+        // against "ababab" alternates between the start residual and the
+        // mid-literal-b residual six times, but only ever visits those
+        // same two residuals, so `max_product_states: 2` must be enough
+        // regardless of the input's length.
+        let config = Config {
+            max_product_states: 2,
+            ..Config::default()
+        };
+        let report =
+            analyze_match_with_backend("(ab)*", "ababab", &config, &DerivativeBackend).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+    }
+
+    #[test]
+    fn match_new_state_still_respects_a_tight_state_limit() {
+        // Complements the two tests above: confirms the limit still fires
+        // when a walk genuinely needs more distinct residuals than
+        // budgeted, so the interning fix hasn't accidentally made the
+        // limit toothless. Matching "ab" against pattern `ab` needs
+        // exactly three distinct residuals in sequence -- `ab`, then `b`,
+        // then `ε` -- so a budget of 2 must not stretch to the third.
+        let config = Config {
+            max_product_states: 2,
+            ..Config::default()
+        };
+        let report = analyze_match_with_backend("ab", "ab", &config, &DerivativeBackend).unwrap();
         assert_eq!(report.verdict, Verdict::Unknown);
     }
 }

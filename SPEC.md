@@ -26,6 +26,7 @@ and configuration.
 | `overlap A B` | `L(A) ∩ L(B) ≠ ∅` | some shared string |
 | `includes A B` | `L(A) ⊆ L(B)` | every string of `A` is in `B` |
 | `equivalent A B` | `L(A) = L(B)` | same language |
+| `match R S` | `S ∈ L(R)` | concrete string membership |
 
 `includes` is directional: left language contained in right language.
 
@@ -119,7 +120,7 @@ regexrel [OPTIONS] <COMMAND>
 regexrel [OPTIONS] <BENCHMARK_FILE>
 ```
 
-Commands: `empty`, `overlap`, `includes`, `equivalent`, `syntax`.
+Commands: `empty`, `match`, `overlap`, `includes`, `equivalent`, `syntax`.
 
 Global options include `--backend`, `--json`, `--stats`, `--print-config`,
 `--fail-on`, and the configuration flags above.

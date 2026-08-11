@@ -53,3 +53,16 @@ trackers, sparse double markers, wide alphabets, structural variants of the
 same language.
 
 Engine notes: [docs/backends.md](../docs/backends.md).
+
+## Match suite (`match_*`)
+
+Concrete membership tests. Prefer `--backend derivatives` or `antimirov`.
+Suffix-tracking patterns like `(a|b)*a(a|b){n}` with a fixed string of length
+`n+1` finish in ~n residual steps; the same pattern under `equivalent`/`overlap`
+explores Θ(2ⁿ) product states.
+
+```bash
+./bench/run.sh --keep-going "--backend derivatives"
+./target/release/regexrel --backend derivatives --stats \
+  match '(a|b)*a(a|b){60}' 'abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+```

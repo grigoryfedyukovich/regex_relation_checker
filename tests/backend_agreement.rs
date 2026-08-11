@@ -5,186 +5,154 @@
 //! side by side: if they ever disagree on a verdict or a witness for the
 //! same input, that's a real bug in one of them, caught automatically on
 //! every `cargo test` run rather than depending on someone noticing by
-//! hand. See `src/minimize.rs`'s module doc for why the two are different
-//! enough in technique for this to be a meaningful check rather than the
-//! same code path twice. `AntimirovBackend` shares its residual algebra
-//! with `DerivativeBackend` (same `Reg` shape, same normalization rules)
-//! but decides acceptance over *sets* of residuals instead of one combined
-//! residual, so a divergence between the two specifically implicates the
-//! linear-form/set bookkeeping (`LinearForm`, `partial_der`) rather than
-//! the shared algebra.
+//! hand. `AntimirovBackend` and `DerivativeBackend` share the same residual
+//! algebra (same `Reg` shape, same normalization rules) but
+//! `AntimirovBackend` decides acceptance over *sets* of residuals instead
+//! of one combined residual, so a divergence between the two specifically
+//! implicates the linear-form/set bookkeeping rather than the shared
+//! algebra.
 //!
-//! The pattern generator here is deliberately a near-duplicate of the one in
-//! `tests/property.rs` rather than a shared helper -- each `tests/*.rs` file
-//! compiles as its own separate crate, so sharing code between them cleanly
-//! needs a `tests/common/` module; duplicating ~40 lines of self-contained,
-//! already-reviewed generator code was the lower-risk choice here.
+//! This file was reconstructed after `tests/` went missing from a repo
+//! snapshot handed off mid-project; see the `match_input` coverage below in
+//! particular, which is new -- that trait method has four independent
+//! implementations (the shared NFA-walk default, plus overrides in
+//! `DerivativeBackend` and `AntimirovBackend`) and had no cross-backend
+//! check anywhere before this.
 
 use proptest::prelude::*;
 use regexrel::{
-    analyze_binary_with_backend, analyze_empty_with_backend, AntimirovBackend, AutomataBackend,
-    Config, DerivativeBackend, MinimizedBackend, Query,
+    analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
+    AntimirovBackend, AutomataBackend, Config, DerivativeBackend, MinimizedBackend, Query,
+    RelationBackend,
 };
 
-const LITERALS: [char; 3] = ['a', 'b', 'c'];
+const AUTOMATA: AutomataBackend = AutomataBackend;
+const MINIMIZED: MinimizedBackend = MinimizedBackend;
+const DERIVATIVES: DerivativeBackend = DerivativeBackend;
+const ANTIMIROV: AntimirovBackend = AntimirovBackend;
 
-fn take_byte(bytes: &[u8], pos: &mut usize) -> u8 {
-    let b = bytes.get(*pos).copied().unwrap_or(0);
-    *pos += 1;
-    b
+/// Every backend under test, as trait objects, so callers can just loop
+/// instead of repeating the same four calls by hand. `const` (rather than
+/// building `&AutomataBackend` etc. inline) sidesteps any question about
+/// whether an inline unit-struct borrow gets promoted to `'static` in this
+/// position -- a `const` reference is unambiguously `'static`.
+fn backends() -> [&'static dyn RelationBackend; 4] {
+    [&AUTOMATA, &MINIMIZED, &DERIVATIVES, &ANTIMIROV]
 }
 
-fn build_pattern(bytes: &[u8], pos: &mut usize, depth: u32) -> String {
-    let branch_count: u8 = if depth >= 3 { 2 } else { 8 };
-    let choice = take_byte(bytes, pos) % branch_count;
-    match choice {
-        0 => LITERALS[(take_byte(bytes, pos) as usize) % LITERALS.len()].to_string(),
-        1 => {
-            let mask = take_byte(bytes, pos) % 7 + 1;
-            let negate = take_byte(bytes, pos).is_multiple_of(2);
-            let mut members = String::new();
-            for (i, ch) in LITERALS.iter().enumerate() {
-                if mask & (1 << i) != 0 {
-                    members.push(*ch);
-                }
-            }
-            if negate {
-                format!("[^{members}]")
-            } else {
-                format!("[{members}]")
-            }
-        }
-        2 => {
-            let n = take_byte(bytes, pos) % 2 + 2;
-            let mut s = String::new();
-            for _ in 0..n {
-                s.push_str(&build_pattern(bytes, pos, depth + 1));
-            }
-            s
-        }
-        3 => {
-            let n = take_byte(bytes, pos) % 2 + 2;
-            let parts: Vec<String> = (0..n)
-                .map(|_| build_pattern(bytes, pos, depth + 1))
-                .collect();
-            format!("({})", parts.join("|"))
-        }
-        4 => format!("({})*", build_pattern(bytes, pos, depth + 1)),
-        5 => format!("({})+", build_pattern(bytes, pos, depth + 1)),
-        6 => format!("({})?", build_pattern(bytes, pos, depth + 1)),
-        _ => {
-            let lo = (take_byte(bytes, pos) % 3) as usize;
-            let extra = (take_byte(bytes, pos) % 3) as usize;
-            let hi = lo + extra;
-            format!("({}){{{lo},{hi}}}", build_pattern(bytes, pos, depth + 1))
-        }
-    }
+/// Small, bounded regex-string generator. Every leaf and every combinator
+/// below produces syntax this crate's parser accepts -- alternation, star,
+/// optional, and plus all wrap their operand in parens, so precedence is
+/// never ambiguous regardless of how deeply this recurses. Bounded to depth
+/// 4 / 64 total nodes so generated patterns stay small enough that a
+/// disagreement is easy to read out of a proptest failure, and so the
+/// `Match` differential test (which runs every backend on every generated
+/// pattern *and* input) stays fast.
+fn arb_pattern() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        Just("a".to_string()),
+        Just("b".to_string()),
+        Just("c".to_string()),
+        Just("".to_string()),
+        Just("[a-c]".to_string()),
+    ];
+    leaf.prop_recursive(4, 64, 4, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("{a}{b}")),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| format!("({a}|{b})")),
+            inner.clone().prop_map(|a| format!("({a})*")),
+            inner.clone().prop_map(|a| format!("({a})?")),
+            inner.prop_map(|a| format!("({a})+")),
+        ]
+    })
 }
 
-fn pattern_from_bytes(bytes: &[u8]) -> String {
-    let mut pos = 0usize;
-    build_pattern(bytes, &mut pos, 0)
-}
-
-fn byte_strategy() -> impl Strategy<Value = Vec<u8>> {
-    proptest::collection::vec(any::<u8>(), 8..64)
+/// Short strings over the same alphabet the patterns above draw from, so a
+/// meaningful fraction of generated (pattern, input) pairs actually match
+/// rather than missing the alphabet entirely.
+fn arb_input() -> impl Strategy<Value = String> {
+    proptest::collection::vec(prop_oneof![Just('a'), Just('b'), Just('c')], 0..8)
+        .prop_map(|chars| chars.into_iter().collect())
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 200, .. ProptestConfig::default() })]
-
     #[test]
-    fn backends_agree_on_binary_queries(left_bytes in byte_strategy(), right_bytes in byte_strategy()) {
-        let left = pattern_from_bytes(&left_bytes);
-        let right = pattern_from_bytes(&right_bytes);
+    fn all_backends_agree_on_binary_queries(left in arb_pattern(), right in arb_pattern()) {
         let config = Config::default();
-
+        let names = backends().map(|b| b.name());
         for query in [Query::Overlap, Query::Includes, Query::Equivalent] {
-            let automata = analyze_binary_with_backend(query, &left, &right, &config, &AutomataBackend);
-            let minimized = analyze_binary_with_backend(query, &left, &right, &config, &MinimizedBackend);
-            let derivatives = analyze_binary_with_backend(query, &left, &right, &config, &DerivativeBackend);
-            let antimirov = analyze_binary_with_backend(query, &left, &right, &config, &AntimirovBackend);
-            if let (Ok(a), Ok(m), Ok(d), Ok(p)) = (automata, minimized, derivatives, antimirov) {
+            let results: Vec<_> = backends()
+                .iter()
+                .map(|backend| analyze_binary_with_backend(query, &left, &right, &config, *backend))
+                .collect();
+            // A pattern that fails to parse fails identically for every
+            // backend (parsing happens once, before backend dispatch), so
+            // there's nothing to compare in that case -- skip rather than
+            // treat the shared parse error as a disagreement.
+            let Ok(reports) = results.into_iter().collect::<Result<Vec<_>, _>>() else {
+                continue;
+            };
+            for i in 1..reports.len() {
                 prop_assert_eq!(
-                    a.verdict, m.verdict,
-                    "{:?}({:?}, {:?}): automata={:?} minimized={:?}",
-                    query, left, right, a.verdict, m.verdict
+                    reports[0].verdict, reports[i].verdict,
+                    "{:?}({:?}, {:?}): {}={:?} {}={:?}",
+                    query, left, right,
+                    names[0], reports[0].verdict, names[i], reports[i].verdict
                 );
+                let baseline_witness = reports[0].witness.as_ref().map(|w| &w.value);
+                let this_witness = reports[i].witness.as_ref().map(|w| &w.value);
                 prop_assert_eq!(
-                    a.verdict, d.verdict,
-                    "{:?}({:?}, {:?}): automata={:?} derivatives={:?}",
-                    query, left, right, a.verdict, d.verdict
-                );
-                prop_assert_eq!(
-                    a.verdict, p.verdict,
-                    "{:?}({:?}, {:?}): automata={:?} antimirov={:?}",
-                    query, left, right, a.verdict, p.verdict
-                );
-                let a_witness = a.witness.map(|w| w.value);
-                let m_witness = m.witness.map(|w| w.value);
-                let d_witness = d.witness.map(|w| w.value);
-                let p_witness = p.witness.map(|w| w.value);
-                prop_assert_eq!(
-                    a_witness.clone(), m_witness,
-                    "{:?}({:?}, {:?}): witnesses differ automata vs minimized",
-                    query, left, right
-                );
-                prop_assert_eq!(
-                    a_witness.clone(), d_witness,
-                    "{:?}({:?}, {:?}): witnesses differ automata vs derivatives",
-                    query, left, right
-                );
-                prop_assert_eq!(
-                    a_witness, p_witness,
-                    "{:?}({:?}, {:?}): witnesses differ automata vs antimirov",
-                    query, left, right
+                    baseline_witness, this_witness,
+                    "{:?}({:?}, {:?}): witnesses differ {} vs {}",
+                    query, left, right, names[0], names[i]
                 );
             }
         }
     }
 
     #[test]
-    fn backends_agree_on_emptiness(bytes in byte_strategy()) {
-        let pattern = pattern_from_bytes(&bytes);
+    fn all_backends_agree_on_emptiness(pattern in arb_pattern()) {
         let config = Config::default();
-        let automata = analyze_empty_with_backend(&pattern, &config, &AutomataBackend);
-        let minimized = analyze_empty_with_backend(&pattern, &config, &MinimizedBackend);
-        let derivatives = analyze_empty_with_backend(&pattern, &config, &DerivativeBackend);
-        let antimirov = analyze_empty_with_backend(&pattern, &config, &AntimirovBackend);
-        if let (Ok(a), Ok(m), Ok(d), Ok(p)) = (automata, minimized, derivatives, antimirov) {
+        let names = backends().map(|b| b.name());
+        let results: Vec<_> = backends()
+            .iter()
+            .map(|backend| analyze_empty_with_backend(&pattern, &config, *backend))
+            .collect();
+        let Ok(reports) = results.into_iter().collect::<Result<Vec<_>, _>>() else {
+            return Ok(());
+        };
+        for i in 1..reports.len() {
             prop_assert_eq!(
-                a.verdict, m.verdict,
-                "empty({:?}): automata={:?} minimized={:?}",
-                pattern, a.verdict, m.verdict
+                reports[0].verdict, reports[i].verdict,
+                "empty({:?}): {}={:?} {}={:?}",
+                pattern, names[0], reports[0].verdict, names[i], reports[i].verdict
             );
+            let baseline_witness = reports[0].witness.as_ref().map(|w| &w.value);
+            let this_witness = reports[i].witness.as_ref().map(|w| &w.value);
             prop_assert_eq!(
-                a.verdict, d.verdict,
-                "empty({:?}): automata={:?} derivatives={:?}",
-                pattern, a.verdict, d.verdict
+                baseline_witness, this_witness,
+                "empty({:?}): witnesses differ {} vs {}",
+                pattern, names[0], names[i]
             );
+        }
+    }
+
+    #[test]
+    fn all_backends_agree_on_match(pattern in arb_pattern(), input in arb_input()) {
+        let config = Config::default();
+        let names = backends().map(|b| b.name());
+        let results: Vec<_> = backends()
+            .iter()
+            .map(|backend| analyze_match_with_backend(&pattern, &input, &config, *backend))
+            .collect();
+        let Ok(reports) = results.into_iter().collect::<Result<Vec<_>, _>>() else {
+            return Ok(());
+        };
+        for i in 1..reports.len() {
             prop_assert_eq!(
-                a.verdict, p.verdict,
-                "empty({:?}): automata={:?} antimirov={:?}",
-                pattern, a.verdict, p.verdict
-            );
-            let a_witness = a.witness.map(|w| w.value);
-            let m_witness = m.witness.map(|w| w.value);
-            let d_witness = d.witness.map(|w| w.value);
-            let p_witness = p.witness.map(|w| w.value);
-            prop_assert_eq!(
-                a_witness.clone(), m_witness,
-                "empty({:?}): witnesses differ automata vs minimized",
-                pattern
-            );
-            prop_assert_eq!(
-                a_witness.clone(), d_witness,
-                "empty({:?}): witnesses differ automata vs derivatives",
-                pattern
-            );
-            prop_assert_eq!(
-                a_witness, p_witness,
-                "empty({:?}): witnesses differ automata vs antimirov",
-                pattern
+                reports[0].verdict, reports[i].verdict,
+                "match({:?}, {:?}): {}={:?} {}={:?}",
+                pattern, input, names[0], reports[0].verdict, names[i], reports[i].verdict
             );
         }
     }

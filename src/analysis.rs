@@ -16,6 +16,8 @@ pub enum Query {
     Overlap,
     Includes,
     Equivalent,
+    /// Concrete full-string membership: does `input` belong to `L(regex)`?
+    Match,
 }
 
 #[derive(Debug, Error)]
@@ -99,6 +101,81 @@ pub trait RelationBackend {
     ) -> BackendResult {
         self.analyze_empty(nfa, config)
     }
+
+    /// Full-string membership test for a concrete `input`.
+    ///
+    /// Default: on-the-fly NFA simulation along the input only (one subset per
+    /// character). Derivative backends override this to walk residuals with
+    /// memoization — the setting where Brzozowski/Antimirov laziness shows.
+    fn match_input(
+        &self,
+        _expr: &crate::ast::Expr,
+        nfa: &Nfa,
+        input: &str,
+        config: &Config,
+    ) -> BackendResult {
+        nfa_match_input(nfa, input, config)
+    }
+}
+
+/// NFA simulation along a concrete string. Visited-state count is the number of
+/// distinct subsets encountered (including the start subset).
+fn nfa_match_input(nfa: &Nfa, input: &str, config: &Config) -> BackendResult {
+    let started = Instant::now();
+    let deadline = Duration::from_millis(config.timeout_ms);
+    let mut subset = nfa.start_subset();
+    let mut seen: HashSet<Vec<usize>> = HashSet::new();
+    seen.insert(subset.clone());
+    let mut generated = 0usize;
+    for ch in input.chars() {
+        if started.elapsed() >= deadline {
+            return BackendResult {
+                status: BackendStatus::Timeout,
+                witness: None,
+                relation: None,
+                visited_states: seen.len(),
+                generated_transitions: generated,
+                analysis_ms: started.elapsed().as_millis(),
+                witness_extraction_ms: 0,
+            };
+        }
+        if seen.len() >= config.max_product_states {
+            return BackendResult {
+                status: BackendStatus::StateLimit,
+                witness: None,
+                relation: None,
+                visited_states: seen.len(),
+                generated_transitions: generated,
+                analysis_ms: started.elapsed().as_millis(),
+                witness_extraction_ms: 0,
+            };
+        }
+        generated += 1;
+        subset = nfa.step(&subset, ch);
+        seen.insert(subset.clone());
+    }
+    let analysis_ms = started.elapsed().as_millis();
+    if nfa.is_accepting(&subset) {
+        BackendResult {
+            status: BackendStatus::Found,
+            witness: Some(input.to_owned()),
+            relation: Some(relation::IN_LANGUAGE.to_owned()),
+            visited_states: seen.len(),
+            generated_transitions: generated,
+            analysis_ms,
+            witness_extraction_ms: 0,
+        }
+    } else {
+        BackendResult {
+            status: BackendStatus::Exhausted,
+            witness: None,
+            relation: None,
+            visited_states: seen.len(),
+            generated_transitions: generated,
+            analysis_ms,
+            witness_extraction_ms: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -145,9 +222,10 @@ pub fn analyze_binary_with_backend(
     backend: &dyn RelationBackend,
 ) -> Result<Report, AnalyzeError> {
     if !matches!(query, Query::Overlap | Query::Includes | Query::Equivalent) {
-        return Err(AnalyzeError::Internal(
-            "binary analysis called with the empty-language query".to_owned(),
-        ));
+        return Err(AnalyzeError::Internal(format!(
+            "binary analysis called with a non-binary query ({query:?}); \
+             use analyze_empty_with_backend or analyze_match_with_backend instead"
+        )));
     }
     let parse_started = Instant::now();
     let left_expr = match parse(left_pattern, config) {
@@ -477,6 +555,148 @@ fn reconstruct<K>(nodes: &[SearchNode<K>], mut node_id: usize) -> String {
     reversed.into_iter().collect()
 }
 
+/// Independently re-simulate the plain NFA on `input` and confirm it
+/// agrees with the backend's verdict, whichever way that verdict went.
+///
+/// This is the `Query::Match` analogue of `validate_empty_witness` /
+/// `validate_binary_witness` above -- but broader: those two only ever
+/// re-check the "a witness was found" case, because independently
+/// re-confirming "exhausted, no witness exists" would mean redoing a full
+/// exhaustive search with a different algorithm, which isn't cheap. For
+/// `Query::Match` there's no such asymmetry: confirming "No" costs exactly
+/// the same as confirming "Yes" (one `nfa.matches(input)` call either way),
+/// so both directions get checked. That matters here specifically because
+/// `match_input` has three independent fast-path implementations
+/// (`AutomataBackend`'s default NFA walk, `DerivativeBackend`'s residual
+/// walk, `AntimirovBackend`'s linear-form walk) with their own caching and
+/// early-exit logic, any of which could in principle disagree with the
+/// others -- or with plain NFA simulation -- on some input. Catching that
+/// here, as an internal error, is strictly better than reporting a
+/// silently wrong Yes/No to the person who ran `match`.
+fn validate_match_witness(report: &mut Report, nfa: &Nfa, input: &str) -> Result<(), AnalyzeError> {
+    if !matches!(report.verdict, Verdict::Yes | Verdict::No) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let actually_matches = nfa.matches(input);
+    let claimed_matches = report.verdict == Verdict::Yes;
+    if actually_matches != claimed_matches {
+        return Err(AnalyzeError::Internal(format!(
+            "match({input:?}) reported {claimed_matches} but independent NFA \
+             replay says {actually_matches}"
+        )));
+    }
+    if let Some(witness) = report.witness.as_mut() {
+        witness.relation = relation::IN_LANGUAGE.to_owned();
+    }
+    report.statistics.timings.witness_validation_ms = started.elapsed().as_millis();
+    report.statistics.timings.refresh_total();
+    Ok(())
+}
+
+pub fn analyze_match(pattern: &str, input: &str, config: &Config) -> Result<Report, AnalyzeError> {
+    analyze_match_with_backend(pattern, input, config, &AutomataBackend)
+}
+
+pub fn analyze_match_with_backend(
+    pattern: &str,
+    input: &str,
+    config: &Config,
+    backend: &dyn RelationBackend,
+) -> Result<Report, AnalyzeError> {
+    let parse_started = Instant::now();
+    let expr = match parse(pattern, config) {
+        Ok(expr) => expr,
+        Err(error) if error.kind == FrontendErrorKind::Unsupported => {
+            return Ok(unsupported_report(
+                Query::Match,
+                "regex",
+                error,
+                config,
+                parse_started.elapsed(),
+                backend,
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let parse_elapsed = parse_started.elapsed();
+
+    let build_started = Instant::now();
+    let nfa = Nfa::from_expr(&expr);
+    let build_elapsed = build_started.elapsed();
+
+    let outcome = backend.match_input(&expr, &nfa, input, config);
+    let mut report = report_from_match_outcome(
+        &nfa,
+        input,
+        outcome,
+        config,
+        parse_elapsed,
+        build_elapsed,
+        backend,
+    );
+    validate_match_witness(&mut report, &nfa, input)?;
+    Ok(report)
+}
+
+fn report_from_match_outcome(
+    nfa: &Nfa,
+    input: &str,
+    outcome: BackendResult,
+    config: &Config,
+    parse_elapsed: Duration,
+    build_elapsed: Duration,
+    backend: &dyn RelationBackend,
+) -> Report {
+    let (verdict, witness, id, message) = match outcome.status {
+        BackendStatus::Found => (
+            Verdict::Yes,
+            outcome
+                .witness
+                .clone()
+                .map(|w| Witness::new(w, relation::IN_LANGUAGE)),
+            "match.yes",
+            "input belongs to the language",
+        ),
+        BackendStatus::Exhausted => (
+            Verdict::No,
+            None,
+            "match.no",
+            "input does not belong to the language",
+        ),
+        BackendStatus::StateLimit => (
+            Verdict::Unknown,
+            None,
+            "match.state_limit",
+            "analysis reached the configured product-state limit",
+        ),
+        BackendStatus::Timeout => (
+            Verdict::Unknown,
+            None,
+            "match.timeout",
+            "analysis reached the configured timeout",
+        ),
+    };
+    let mut report = base_report(
+        Query::Match,
+        verdict,
+        witness,
+        id,
+        message,
+        nfa.states.len(),
+        None,
+        outcome,
+        config,
+        parse_elapsed,
+        build_elapsed,
+        backend,
+    );
+    if report.verdict == Verdict::No {
+        report.diagnostic.input = Some(input.to_owned());
+    }
+    report
+}
+
 #[allow(clippy::too_many_arguments)]
 fn report_from_binary_outcome(
     query: Query,
@@ -511,7 +731,7 @@ fn report_from_binary_outcome(
                     "the two languages are not equivalent",
                     Some(Witness::new(value, relation)),
                 ),
-                Query::Empty => unreachable!(),
+                Query::Empty | Query::Match => unreachable!("binary outcome with non-binary query"),
             }
         }
         BackendStatus::Exhausted => match query {
@@ -533,7 +753,7 @@ fn report_from_binary_outcome(
                 "the two languages are equivalent",
                 None,
             ),
-            Query::Empty => unreachable!(),
+            Query::Empty | Query::Match => unreachable!("binary outcome with non-binary query"),
         },
         BackendStatus::StateLimit => (
             Verdict::Unknown,
@@ -900,7 +1120,7 @@ mod tests {
             Query::Equivalent => words
                 .iter()
                 .all(|word| left.matches(word) == right.matches(word)),
-            Query::Empty => unreachable!(),
+            Query::Empty | Query::Match => unreachable!(),
         };
         if property_holds {
             Verdict::Yes
@@ -934,7 +1154,7 @@ mod tests {
                             Query::Overlap => left_matches && right_matches,
                             Query::Includes => left_matches && !right_matches,
                             Query::Equivalent => left_matches != right_matches,
-                            Query::Empty => unreachable!(),
+                            Query::Empty | Query::Match => unreachable!(),
                         });
                     }
                 }
@@ -1271,5 +1491,89 @@ mod tests {
         let report = analyze_empty("a", &config).unwrap();
         assert_eq!(report.verdict, Verdict::Unknown);
         assert_eq!(report.diagnostic.id, "RR_STATE_LIMIT");
+    }
+
+    // `Query::Match` had no test coverage at all before this: not in this
+    // module, and (separately -- see the audit notes) the `tests/`
+    // integration-test directory that would normally cross-check every
+    // `RelationBackend` against each other isn't part of this snapshot.
+    // These at least lock in `analyze_match`'s own behavior and the two
+    // bugs fixed alongside it (missing witness validation; the "No" case's
+    // diagnostic message/input never reaching text output).
+
+    #[test]
+    fn match_yes_and_no() {
+        let report = analyze_match("a+b", "aab", &Config::default()).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert_eq!(report.witness.unwrap().value, "aab");
+
+        let report = analyze_match("a+b", "abb", &Config::default()).unwrap();
+        assert_eq!(report.verdict, Verdict::No);
+        assert!(report.witness.is_none());
+        // The diagnostic detail `render_text` surfaces for this case (see
+        // the `main.rs` fix) has to actually be populated for that fix to
+        // do anything.
+        assert_eq!(report.diagnostic.input.as_deref(), Some("abb"));
+        assert!(!report.diagnostic.message.is_empty());
+    }
+
+    #[test]
+    fn match_empty_string_input() {
+        let report = analyze_match("a*", "", &Config::default()).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert_eq!(report.witness.unwrap().value, "");
+
+        let report = analyze_match("a+", "", &Config::default()).unwrap();
+        assert_eq!(report.verdict, Verdict::No);
+    }
+
+    #[test]
+    fn match_unsupported_pattern_is_reported_not_erred() {
+        let report = analyze_match(r"(a)\1", "aa", &Config::default()).unwrap();
+        assert_eq!(report.verdict, Verdict::Unsupported);
+    }
+
+    #[test]
+    fn match_agrees_across_every_backend() {
+        // `match_input` has four independent implementations (the default
+        // NFA walk `AutomataBackend`/`MinimizedBackend` share, plus
+        // `DerivativeBackend`'s and `AntimirovBackend`'s own residual
+        // walks). Nothing else in this snapshot checks them against each
+        // other, so this at least covers the cases most likely to expose a
+        // divergence: a plain match, a near-miss, the empty string, and a
+        // pattern with nontrivial nullable/star structure.
+        let backends: &[&dyn RelationBackend] = &[
+            &AutomataBackend,
+            &crate::minimize::MinimizedBackend,
+            &crate::derivative::DerivativeBackend,
+            &crate::antimirov::AntimirovBackend,
+        ];
+        let cases = [
+            ("a+b", "aab", true),
+            ("a+b", "abb", false),
+            ("(a|b|c*)?", "", true),
+            ("(a|b)*a(a|b){3}", "aaaa", true),
+            ("(a|b)*a(a|b){3}", "aaa", false),
+        ];
+        for (pattern, input, expect_match) in cases {
+            for backend in backends {
+                let report =
+                    analyze_match_with_backend(pattern, input, &Config::default(), *backend)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "match({pattern:?}, {input:?}) on {} errored: {e}",
+                                backend.name()
+                            )
+                        });
+                let matched = report.verdict == Verdict::Yes;
+                assert_eq!(
+                    matched,
+                    expect_match,
+                    "match({pattern:?}, {input:?}) on {}: got {:?}, expected match={expect_match}",
+                    backend.name(),
+                    report.verdict
+                );
+            }
+        }
     }
 }

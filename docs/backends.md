@@ -180,6 +180,17 @@ alternation where residual *sets* stay narrow; research comparisons on the
 ./bench/run.sh --keep-going "--backend antimirov --max-states 1000000 --timeout-ms 60000"
 ```
 
+## Concrete membership: `match`
+
+`regexrel match <regex> <string>` is full-string membership. The default path
+simulates the NFA along the input. **Derivative** and **Antimirov** backends
+override `match_input` to walk residuals character-by-character with memoization.
+
+This is the setting where derivatives are classically strong: a regex whose
+*language* automaton is enormous can still match a given string after only as
+many residual steps as the string is long (e.g. `(a|b)*a(a|b){60}` vs 61
+characters). Relation queries on the same pattern explore Θ(2ⁿ) product states.
+
 ## Resource limits (all backends)
 
 | Config / flag | Meaning |

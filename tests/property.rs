@@ -32,7 +32,7 @@
 
 use proptest::prelude::*;
 use regexrel::ast::{Expr, ExprKind};
-use regexrel::{analyze_binary, parse, Config, Query, Verdict};
+use regexrel::{analyze_binary, analyze_match, parse, Config, Query, Verdict};
 use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------
@@ -117,6 +117,21 @@ fn pattern_from_bytes(bytes: &[u8]) -> String {
 
 fn byte_strategy() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 8..64)
+}
+
+/// Candidate strings to test `analyze_match` against, drawn from
+/// `BRUTE_ALPHABET` below (defined further down, next to the brute-force
+/// search that motivates it) so match-input coverage and counterexample
+/// coverage stay over the same alphabet for the same reason: sufficient by
+/// construction, since every literal/class member `build_pattern` can ever
+/// produce comes from `LITERALS`, and 'z' stands in for everything else.
+fn match_input_strategy() -> impl Strategy<Value = String> {
+    proptest::collection::vec(any::<u8>(), 0..8).prop_map(|bytes| {
+        bytes
+            .iter()
+            .map(|&b| BRUTE_ALPHABET[b as usize % 4])
+            .collect()
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -235,7 +250,9 @@ fn any_counterexample(query: Query, left: &Expr, right: &Expr) -> Option<String>
             Query::Overlap => lm && rm,
             Query::Includes => lm && !rm,
             Query::Equivalent => lm != rm,
-            Query::Empty => unreachable!("this helper is only used for binary queries"),
+            Query::Empty | Query::Match => {
+                unreachable!("this helper is only used for binary queries")
+            }
         };
         if is_counterexample {
             return Some(w.clone());
@@ -287,7 +304,7 @@ proptest! {
                     Query::Overlap => lm && rm,
                     Query::Includes => lm && !rm,
                     Query::Equivalent => lm != rm,
-                    Query::Empty => unreachable!(),
+                    Query::Empty | Query::Match => unreachable!(),
                 };
                 prop_assert!(
                     holds,
@@ -390,5 +407,48 @@ proptest! {
                 left_pattern, right_pattern, eq.verdict, fwd.verdict, bwd.verdict
             );
         }
+    }
+
+    /// `analyze_match(pattern, input)` checked against `full_match`, the
+    /// same independent AST-walking interpreter the binary-query test above
+    /// uses. This doesn't check that `regexrel`'s backends agree with each
+    /// other (`tests/backend_agreement.rs` does that) -- it checks the
+    /// `match` feature end-to-end against ground truth that shares no code
+    /// with the NFA/subset-construction machinery, the Brzozowski residual
+    /// machinery, or the Antimirov linear-form machinery.
+    #[test]
+    fn analyze_match_agrees_with_independent_interpreter(
+        bytes in byte_strategy(),
+        input in match_input_strategy(),
+    ) {
+        let pattern = pattern_from_bytes(&bytes);
+        let config = Config::default();
+        let Ok(expr) = parse(&pattern, &config) else { return Ok(()); };
+
+        // `analyze_match` re-parses `pattern` with the same `config`
+        // internally; since that already succeeded once above (`expr`),
+        // it cannot fail to parse a second time. So the only way this call
+        // can return `Err` here is `AnalyzeError::Internal` -- i.e. exactly
+        // the witness-validation safety net (a backend disagreeing with
+        // plain NFA replay on this input) firing for real. Fail loudly
+        // instead of silently skipping, or this test would quietly stop
+        // covering the one failure mode it exists to catch.
+        let report = analyze_match(&pattern, &input, &config).unwrap_or_else(|e| {
+            panic!(
+                "analyze_match({pattern:?}, {input:?}) errored even though the pattern \
+                 already parsed successfully: {e}"
+            )
+        });
+        if !matches!(report.verdict, Verdict::Yes | Verdict::No) {
+            return Ok(()); // UNKNOWN / UNSUPPORTED: out of scope for this check
+        }
+
+        let expected = full_match(&expr, &input);
+        let reported = report.verdict == Verdict::Yes;
+        prop_assert_eq!(
+            reported, expected,
+            "match({:?}, {:?}) reported {:?} but the independent interpreter says matches={}",
+            pattern, input, report.verdict, expected
+        );
     }
 }

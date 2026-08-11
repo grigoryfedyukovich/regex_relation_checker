@@ -18,7 +18,8 @@ pub mod report;
 
 pub use analysis::{
     analyze_binary, analyze_binary_with_backend, analyze_empty, analyze_empty_with_backend,
-    AnalyzeError, AutomataBackend, BackendResult, BackendStatus, Query, RelationBackend,
+    analyze_match, analyze_match_with_backend, AnalyzeError, AutomataBackend, BackendResult,
+    BackendStatus, Query, RelationBackend,
 };
 pub use antimirov::AntimirovBackend;
 pub use config::{Alphabet, Config};

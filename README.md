@@ -37,6 +37,8 @@ cargo build --release
 
 ```bash
 regexrel empty 'a|b'
+regexrel match '(a|b)*a(a|b){40}' 'abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+regexrel --backend derivatives --stats match '(a|b)*a(a|b){40}' 'abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 regexrel syntax
 regexrel --json equivalent '^a+$' 'aa*'
 regexrel --stats --backend minimized --max-states 50000 overlap 'a.*z' 'ab+z'
@@ -55,6 +57,10 @@ upfront determinization cost. Strong default for small and medium patterns.
 Fully determinizes and minimizes each side. **Equivalence** can finish via
 minimal-DFA isomorphism without a product search; other queries (and
 non-isomorphic equivalence) product-search the minimized DFAs.
+
+### `match` (concrete membership)
+
+`regexrel match <regex> <string>` tests full-string membership. Derivative backends walk only the residuals the input visits (memoized); this is where Brzozowski/Antimirov laziness shows, unlike relation queries.
 
 ### `derivatives`
 
