@@ -40,34 +40,63 @@ enum RegKind {
     Star(Reg),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct Reg(Rc<RegKind>);
+/// Computes a `RegKind`'s hash once, at construction time (see `Reg::wrap`).
+///
+/// This is the basis for hash-consing `Reg`: because `RegKind`'s derived
+/// `Hash` impl hashes its `Vec<Reg>`/`Reg` fields through *their* `Hash`
+/// impl, and `Reg::hash` (below) is overridden to just return this cached
+/// value in O(1), computing a *new* parent node's hash only means
+/// combining its immediate children's already-cached hashes -- not
+/// re-walking their entire subtrees. Without this, hashing the same large
+/// shared subterm repeatedly (e.g. as a `HashSet<Reg>` member during
+/// dedup, or as part of a `(Reg, char)` cache key, both on the hot path
+/// for wide linear forms) costs O(size) *every single time*, hit or miss.
+fn compute_hash(kind: &RegKind) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Clone, Debug)]
+struct Reg(Rc<(RegKind, u64)>);
 
 impl Reg {
+    fn kind(&self) -> &RegKind {
+        &self.0.as_ref().0
+    }
+    /// Build a `Reg` from a fresh `RegKind`, computing and caching its
+    /// hash once. Every smart constructor below goes through this instead
+    /// of `Self(Rc::new(...))` directly.
+    fn wrap(kind: RegKind) -> Self {
+        let h = compute_hash(&kind);
+        Self(Rc::new((kind, h)))
+    }
+
     fn null() -> Self {
-        Self(Rc::new(RegKind::Null))
+        Self::wrap(RegKind::Null)
     }
     fn eps() -> Self {
-        Self(Rc::new(RegKind::Eps))
+        Self::wrap(RegKind::Eps)
     }
     fn atom(set: CharSet) -> Self {
         if set.is_empty() {
             Self::null()
         } else {
-            Self(Rc::new(RegKind::Atom(set)))
+            Self::wrap(RegKind::Atom(set))
         }
     }
     fn star(inner: Reg) -> Self {
-        match inner.0.as_ref() {
+        match inner.kind() {
             RegKind::Null | RegKind::Eps => Self::eps(),
             RegKind::Star(_) => inner,
-            _ => Self(Rc::new(RegKind::Star(inner))),
+            _ => Self::wrap(RegKind::Star(inner)),
         }
     }
     fn concat(parts: Vec<Reg>) -> Self {
         let mut flat = Vec::new();
         for part in parts {
-            match part.0.as_ref() {
+            match part.kind() {
                 RegKind::Null => return Self::null(),
                 RegKind::Eps => {}
                 RegKind::Concat(inner) => flat.extend(inner.iter().cloned()),
@@ -77,13 +106,13 @@ impl Reg {
         match flat.len() {
             0 => Self::eps(),
             1 => flat.pop().unwrap(),
-            _ => Self(Rc::new(RegKind::Concat(flat))),
+            _ => Self::wrap(RegKind::Concat(flat)),
         }
     }
     fn alt(branches: Vec<Reg>) -> Self {
         let mut flat = Vec::new();
         for b in branches {
-            match b.0.as_ref() {
+            match b.kind() {
                 RegKind::Null => {}
                 RegKind::Alt(inner) => flat.extend(inner.iter().cloned()),
                 _ => flat.push(b),
@@ -94,12 +123,12 @@ impl Reg {
         match flat.len() {
             0 => Self::null(),
             1 => flat.pop().unwrap(),
-            _ => Self(Rc::new(RegKind::Alt(flat))),
+            _ => Self::wrap(RegKind::Alt(flat)),
         }
     }
 
     fn nullable(&self) -> bool {
-        match self.0.as_ref() {
+        match self.kind() {
             RegKind::Null | RegKind::Atom(_) => false,
             RegKind::Eps | RegKind::Star(_) => true,
             RegKind::Concat(parts) => parts.iter().all(Reg::nullable),
@@ -108,7 +137,7 @@ impl Reg {
     }
 
     fn first_sets(&self, out: &mut Vec<CharSet>) {
-        match self.0.as_ref() {
+        match self.kind() {
             RegKind::Null | RegKind::Eps => {}
             RegKind::Atom(set) => out.push(set.clone()),
             RegKind::Concat(parts) => {
@@ -134,6 +163,24 @@ impl Reg {
     }
 }
 
+impl std::hash::Hash for Reg {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // O(1): just the cached hash, never a tree walk. See `compute_hash`.
+        self.0.as_ref().1.hash(state);
+    }
+}
+
+impl PartialEq for Reg {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast rejection on the cached hash before ever touching the
+        // (potentially large) `RegKind` comparison. The `RegKind` compare
+        // only runs when hashes already match -- true equality, or an
+        // astronomically rare 64-bit collision.
+        self.0.as_ref().1 == other.0.as_ref().1 && self.0.as_ref().0 == other.0.as_ref().0
+    }
+}
+impl Eq for Reg {}
+
 fn reg_ord(a: &Reg, b: &Reg) -> Ordering {
     use RegKind::*;
     fn rank(k: &RegKind) -> u8 {
@@ -146,7 +193,7 @@ fn reg_ord(a: &Reg, b: &Reg) -> Ordering {
             Star(_) => 5,
         }
     }
-    let (ka, kb) = (a.0.as_ref(), b.0.as_ref());
+    let (ka, kb) = (a.kind(), b.kind());
     match rank(ka).cmp(&rank(kb)) {
         Ordering::Equal => {}
         o => return o,
@@ -155,22 +202,38 @@ fn reg_ord(a: &Reg, b: &Reg) -> Ordering {
         (Atom(sa), Atom(sb)) => {
             let ia = sa.intervals();
             let ib = sb.intervals();
+            match ia.len().cmp(&ib.len()) {
+                Ordering::Equal => {}
+                o => return o,
+            }
             for (x, y) in ia.iter().zip(ib.iter()) {
                 match (x.start, x.end).cmp(&(y.start, y.end)) {
                     Ordering::Equal => {}
                     o => return o,
                 }
             }
-            ia.len().cmp(&ib.len())
+            Ordering::Equal
         }
         (Concat(pa), Concat(pb)) | (Alt(pa), Alt(pb)) => {
+            // Length first, *then* elementwise -- confirmed via direct
+            // instrumentation (not just bench pass/fail, which can't tell
+            // "faster but still over budget" from "no effect") to be
+            // where `from_parts`'s sort spends most of its time on chains
+            // like 500 concatenated `a?`s: comparing two different-length
+            // Concat chains built from the same repeated element walks
+            // every shared element (all trivially equal) before ever
+            // reaching the part that actually distinguishes them.
+            match pa.len().cmp(&pb.len()) {
+                Ordering::Equal => {}
+                o => return o,
+            }
             for (x, y) in pa.iter().zip(pb.iter()) {
                 match reg_ord(x, y) {
                     Ordering::Equal => {}
                     o => return o,
                 }
             }
-            pa.len().cmp(&pb.len())
+            Ordering::Equal
         }
         (Star(ia), Star(ib)) => reg_ord(ia, ib),
         _ => Ordering::Equal,
@@ -233,7 +296,7 @@ impl LinearForm {
     }
 
     fn singleton(r: Reg) -> Self {
-        if matches!(r.0.as_ref(), RegKind::Null) {
+        if matches!(r.kind(), RegKind::Null) {
             Self::empty()
         } else {
             Self(vec![r])
@@ -255,23 +318,45 @@ impl LinearForm {
     }
 
     /// Build a normalized linear form from raw, possibly-unsorted,
-    /// possibly-duplicated, possibly-`Null` members in a single
-    /// sort/dedup/filter pass.
+    /// possibly-duplicated, possibly-`Null` members in a single pass.
     ///
     /// Prefer this over folding many sources together with repeated
     /// [`LinearForm::union`] calls: each `union` re-sorts and re-dedups its
     /// accumulator from scratch, so combining `k` sources one at a time
     /// (as in `∂ₐ(E₁|E₂|…|Eₖ) = ∂ₐ(E₁) ∪ ∂ₐ(E₂) ∪ … ∪ ∂ₐ(Eₖ)`) costs
     /// `O(k² log k)`. Collecting every source's raw members into one `Vec`
-    /// first and normalizing once costs `O(k log k)`. This is exactly the
-    /// case that matters for wide alternation -- the pattern shape this
-    /// backend exists to handle well (see the module doc comment).
-    fn from_parts(mut parts: Vec<Reg>) -> Self {
-        parts.sort_by(reg_ord);
-        parts.dedup();
-        // Drop explicit Null if any slipped in.
-        parts.retain(|r| !matches!(r.0.as_ref(), RegKind::Null));
-        Self(parts)
+    /// first and normalizing once is the point of batching in the first
+    /// place -- this is exactly the case that matters for wide
+    /// alternation, the pattern shape this backend exists to handle well
+    /// (see the module doc comment).
+    ///
+    /// Deliberately hash-based (dedup first, sort only the survivors)
+    /// rather than sort-then-dedup, though: `partial_der`'s `Concat` case
+    /// is recursive, and each member of a wide linear form can itself
+    /// expand into its own full downward-closed derivative set (this is
+    /// the "`tail` recurs constantly" case the `Concat` case's own comment
+    /// describes). For a chain of `k` nullable elements (`a?` repeated,
+    /// with no wrapping `*`, is exactly this shape), the raw `parts`
+    /// handed to this function can be `Θ(k^2)` in size even though the
+    /// truly distinct count is `Θ(k)` -- almost all of it duplicates.
+    /// Sorting that raw list first, the way this used to work, pays for
+    /// `Θ(k^2 log k)` comparisons before `dedup()` ever gets to throw
+    /// nearly all of them away. Hashing every element into a `HashSet`
+    /// first collapses the duplicates in one amortized-O(1)-per-element
+    /// pass (each element is still touched once, but never compared
+    /// against arbitrarily many others the way a sort does), and only the
+    /// true survivors -- `Θ(k)`, not `Θ(k^2)` -- ever reach the sort that
+    /// gives this its canonical order.
+    fn from_parts(parts: Vec<Reg>) -> Self {
+        let mut seen: HashSet<Reg> = HashSet::with_capacity(parts.len());
+        for r in parts {
+            if !matches!(r.kind(), RegKind::Null) {
+                seen.insert(r);
+            }
+        }
+        let mut deduped: Vec<Reg> = seen.into_iter().collect();
+        deduped.sort_by(reg_ord);
+        Self(deduped)
     }
 
     fn union(mut self, other: LinearForm) -> Self {
@@ -281,10 +366,10 @@ impl LinearForm {
 
     /// Right-concatenate every member with `tail`.
     fn then_all(self, tail: &Reg) -> Self {
-        if matches!(tail.0.as_ref(), RegKind::Null) {
+        if matches!(tail.kind(), RegKind::Null) {
             return Self::empty();
         }
-        if matches!(tail.0.as_ref(), RegKind::Eps) {
+        if matches!(tail.kind(), RegKind::Eps) {
             return self;
         }
         let mut out = Vec::with_capacity(self.0.len());
@@ -300,7 +385,7 @@ fn partial_der(r: &Reg, ch: char, cache: &mut HashMap<(Reg, char), LinearForm>) 
     if let Some(cached) = cache.get(&(r.clone(), ch)) {
         return cached.clone();
     }
-    let result = match r.0.as_ref() {
+    let result = match r.kind() {
         RegKind::Null | RegKind::Eps => LinearForm::empty(),
         RegKind::Atom(set) => {
             if set.contains(ch) {
@@ -1066,5 +1151,78 @@ mod tests {
         };
         let report = analyze_match_with_backend("ab", "ab", &config, &AntimirovBackend).unwrap();
         assert_eq!(report.verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn dedup_is_order_independent_for_same_length_chains() {
+        // General regression guard for `LinearForm::from_parts`'s
+        // sort+dedup (independent of any particular `reg_ord`
+        // implementation): construction order must never affect the
+        // normalized result, and duplicates must always collapse.
+        //
+        // Build the same set of terms two different ways -- forwards and
+        // reversed -- and check `LinearForm::from_parts` produces the
+        // identical, fully-deduplicated result regardless of input order.
+        // The terms are deliberately different-length chains of the same
+        // repeated element (the shape a `(a?)^n` derivative walk
+        // produces), since that shape is what past attempts at optimizing
+        // `reg_ord` for this codebase have touched -- this test is meant
+        // to survive whichever comparator implementation is in place.
+        fn chain(n: usize) -> Reg {
+            let opt_a = Reg::alt(vec![Reg::eps(), Reg::atom(CharSet::singleton('a'))]);
+            Reg::concat(vec![opt_a; n])
+        }
+        let forward: Vec<Reg> = (0..8).map(chain).collect();
+        let mut backward = forward.clone();
+        backward.reverse();
+        // Duplicate a couple of entries too, so dedup has real work to do.
+        let mut with_dupes = forward.clone();
+        with_dupes.push(chain(3));
+        with_dupes.push(chain(3));
+        with_dupes.push(chain(0));
+
+        let a = LinearForm::from_parts(forward);
+        let b = LinearForm::from_parts(backward);
+        let c = LinearForm::from_parts(with_dupes);
+        assert_eq!(
+            a, b,
+            "order of construction must not affect the normalized form"
+        );
+        assert_eq!(
+            a, c,
+            "duplicate entries must still collapse to the same normalized form"
+        );
+        assert_eq!(
+            a.0.len(),
+            8,
+            "8 distinct chain lengths, no accidental merging"
+        );
+    }
+
+    #[test]
+    fn match_bounded_optional_chain_no_wrapping_star() {
+        // Correctness check on the actual shape of the
+        // `match_500_optional_*` bench files: N concatenated `a?`s with no
+        // outer `*`, i.e. a genuine bounded counter ("0 to N a's"), not
+        // the `antimirov-block-position` family's collapsible-to-few-states
+        // shape. Kept small (N=60) so it's a fast, deterministic
+        // correctness check, independent of whatever the current
+        // performance characteristics of the real N=500 case happen to
+        // be (that's an open perf question -- see the `match_500_optional_*`
+        // bench investigation notes -- this test only guards correctness).
+        let pattern = "a?".repeat(60);
+        let config = Config::default();
+        let within =
+            analyze_match_with_backend(&pattern, &"a".repeat(40), &config, &AntimirovBackend)
+                .unwrap();
+        assert_eq!(within.verdict, Verdict::Yes);
+        let exact =
+            analyze_match_with_backend(&pattern, &"a".repeat(60), &config, &AntimirovBackend)
+                .unwrap();
+        assert_eq!(exact.verdict, Verdict::Yes);
+        let too_many =
+            analyze_match_with_backend(&pattern, &"a".repeat(61), &config, &AntimirovBackend)
+                .unwrap();
+        assert_eq!(too_many.verdict, Verdict::No);
     }
 }
