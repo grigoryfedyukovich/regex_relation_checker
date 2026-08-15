@@ -46,38 +46,84 @@ enum RegKind {
     Star(Reg),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct Reg(Rc<RegKind>);
+/// Computes a `RegKind`'s hash once, at construction time (see `Reg::wrap`).
+///
+/// This is the basis for hash-consing `Reg`: because `RegKind`'s derived
+/// `Hash` impl hashes its `Vec<Reg>`/`Reg` fields through *their* `Hash`
+/// impl, and `Reg::hash` (below) is overridden to just return this cached
+/// value in O(1), computing a *new* parent node's hash only means
+/// combining its immediate children's already-cached hashes -- not
+/// re-walking their entire subtrees. Without this, hashing the same large
+/// shared subterm repeatedly (e.g. as a `HashMap<(Reg, char), Reg>` key
+/// in `search_product`'s caches, or in `ResidualInterner`'s
+/// `HashMap<Reg, usize>`) costs O(size) *every single time*, hit or miss.
+fn compute_hash(kind: &RegKind) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Clone, Debug)]
+struct Reg(Rc<(RegKind, u64)>);
+
+impl std::hash::Hash for Reg {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // O(1): just the cached hash, never a tree walk. See `compute_hash`.
+        self.0.as_ref().1.hash(state);
+    }
+}
+
+impl PartialEq for Reg {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast rejection on the cached hash before ever touching the
+        // (potentially large) `RegKind` comparison. The `RegKind` compare
+        // only runs when hashes already match -- true equality, or an
+        // astronomically rare 64-bit collision.
+        self.0.as_ref().1 == other.0.as_ref().1 && self.0.as_ref().0 == other.0.as_ref().0
+    }
+}
+impl Eq for Reg {}
 
 impl Reg {
+    fn kind(&self) -> &RegKind {
+        &self.0.as_ref().0
+    }
+    /// Build a `Reg` from a fresh `RegKind`, computing and caching its
+    /// hash once. Every smart constructor below goes through this instead
+    /// of `Self(Rc::new(...))` directly.
+    fn wrap(kind: RegKind) -> Self {
+        let h = compute_hash(&kind);
+        Self(Rc::new((kind, h)))
+    }
+
     fn null() -> Self {
-        Self(Rc::new(RegKind::Null))
+        Self::wrap(RegKind::Null)
     }
 
     fn eps() -> Self {
-        Self(Rc::new(RegKind::Eps))
+        Self::wrap(RegKind::Eps)
     }
 
     fn atom(set: CharSet) -> Self {
         if set.is_empty() {
             Self::null()
         } else {
-            Self(Rc::new(RegKind::Atom(set)))
+            Self::wrap(RegKind::Atom(set))
         }
     }
 
     fn star(inner: Reg) -> Self {
-        match inner.0.as_ref() {
+        match inner.kind() {
             RegKind::Null | RegKind::Eps => Self::eps(),
             RegKind::Star(_) => inner,
-            _ => Self(Rc::new(RegKind::Star(inner))),
+            _ => Self::wrap(RegKind::Star(inner)),
         }
     }
 
     fn concat(parts: Vec<Reg>) -> Self {
         let mut flat = Vec::new();
         for part in parts {
-            match part.0.as_ref() {
+            match part.kind() {
                 RegKind::Null => return Self::null(),
                 RegKind::Eps => {}
                 RegKind::Concat(inner) => flat.extend(inner.iter().cloned()),
@@ -87,30 +133,40 @@ impl Reg {
         match flat.len() {
             0 => Self::eps(),
             1 => flat.pop().unwrap(),
-            _ => Self(Rc::new(RegKind::Concat(flat))),
+            _ => Self::wrap(RegKind::Concat(flat)),
         }
     }
 
     fn alt(parts: Vec<Reg>) -> Self {
         let mut flat = Vec::new();
         for part in parts {
-            match part.0.as_ref() {
+            match part.kind() {
                 RegKind::Null => {}
                 RegKind::Alt(inner) => flat.extend(inner.iter().cloned()),
                 _ => flat.push(part),
             }
         }
+        // Hash-based dedup, not sort-then-dedup: cheap now that hashing a
+        // `Reg` is O(1) (see `compute_hash`), and avoids paying for a full
+        // `O(k log k)` comparison-based sort over entries that might
+        // largely be duplicates before ever throwing most of them away.
+        // The final canonical order still needs `reg_ord`, so the
+        // (now much smaller, deduplicated) survivors get sorted after.
+        let mut seen: HashSet<Reg> = HashSet::with_capacity(flat.len());
+        for r in flat {
+            seen.insert(r);
+        }
+        let mut flat: Vec<Reg> = seen.into_iter().collect();
         flat.sort_by(reg_ord);
-        flat.dedup();
         match flat.len() {
             0 => Self::null(),
             1 => flat.pop().unwrap(),
-            _ => Self(Rc::new(RegKind::Alt(flat))),
+            _ => Self::wrap(RegKind::Alt(flat)),
         }
     }
 
     fn nullable(&self) -> bool {
-        match self.0.as_ref() {
+        match self.kind() {
             RegKind::Null | RegKind::Atom(_) => false,
             RegKind::Eps | RegKind::Star(_) => true,
             RegKind::Concat(parts) => parts.iter().all(Reg::nullable),
@@ -120,7 +176,7 @@ impl Reg {
 
     /// Collect outermost character sets that can start a non-empty word.
     fn first_sets(&self, out: &mut Vec<CharSet>) {
-        match self.0.as_ref() {
+        match self.kind() {
             RegKind::Null | RegKind::Eps => {}
             RegKind::Atom(set) => out.push(set.clone()),
             RegKind::Concat(parts) => {
@@ -141,7 +197,7 @@ impl Reg {
     }
 
     fn derivative(&self, ch: char) -> Reg {
-        match self.0.as_ref() {
+        match self.kind() {
             RegKind::Null | RegKind::Eps => Self::null(),
             RegKind::Atom(set) => {
                 if set.contains(ch) {
@@ -186,8 +242,8 @@ fn reg_ord(a: &Reg, b: &Reg) -> std::cmp::Ordering {
             RegKind::Star(_) => 5,
         }
     }
-    let ka = a.0.as_ref();
-    let kb = b.0.as_ref();
+    let ka = a.kind();
+    let kb = b.kind();
     match rank(ka).cmp(&rank(kb)) {
         Ordering::Equal => {}
         other => return other,
@@ -197,31 +253,67 @@ fn reg_ord(a: &Reg, b: &Reg) -> std::cmp::Ordering {
         (RegKind::Atom(sa), RegKind::Atom(sb)) => {
             let ia = sa.intervals();
             let ib = sb.intervals();
+            // Length first: sets with a different number of intervals can
+            // never be equal, so this decides most unequal pairs in O(1)
+            // instead of walking min(len) intervals first. Same rationale
+            // as the Concat/Alt cases below.
+            match ia.len().cmp(&ib.len()) {
+                Ordering::Equal => {}
+                other => return other,
+            }
             for (a, b) in ia.iter().zip(ib.iter()) {
                 match (a.start, a.end).cmp(&(b.start, b.end)) {
                     Ordering::Equal => {}
                     other => return other,
                 }
             }
-            ia.len().cmp(&ib.len())
+            Ordering::Equal
         }
         (RegKind::Concat(pa), RegKind::Concat(pb)) => {
+            // Length first, *then* elementwise -- not the reverse. Two
+            // lists of different length can never be equal, so checking
+            // length up front lets most comparisons between
+            // differently-sized terms finish in O(1) instead of walking
+            // min(len) shared elements only to fall back to the same
+            // length check anyway.
+            //
+            // This matters far more than it looks like it should: for a
+            // pattern like 500 concatenated `a?`s (no wrapping `*`), each
+            // derivative step's residual is a single `Alt` of up to ~n
+            // branches -- `Concat` chains that are literally suffixes of
+            // the same repeated element, differing *only* in length.
+            // Comparing two of them elementwise-first walks every shared
+            // element (all trivially equal) before ever reaching the part
+            // that actually distinguishes them -- turning what should be
+            // an O(1) decision into an O(n) one, repeated across every
+            // comparison in the sort. Confirmed on the analogous
+            // `AntimirovBackend` case (same shape, same cost) before
+            // porting the same fix here.
+            match pa.len().cmp(&pb.len()) {
+                Ordering::Equal => {}
+                other => return other,
+            }
             for (x, y) in pa.iter().zip(pb.iter()) {
                 match reg_ord(x, y) {
                     Ordering::Equal => {}
                     other => return other,
                 }
             }
-            pa.len().cmp(&pb.len())
+            Ordering::Equal
         }
         (RegKind::Alt(pa), RegKind::Alt(pb)) => {
+            // Same length-first rationale as the Concat case above.
+            match pa.len().cmp(&pb.len()) {
+                Ordering::Equal => {}
+                other => return other,
+            }
             for (x, y) in pa.iter().zip(pb.iter()) {
                 match reg_ord(x, y) {
                     Ordering::Equal => {}
                     other => return other,
                 }
             }
-            pa.len().cmp(&pb.len())
+            Ordering::Equal
         }
         (RegKind::Star(ia), RegKind::Star(ib)) => reg_ord(ia, ib),
         _ => Ordering::Equal,
@@ -330,8 +422,8 @@ fn classify_relation(
 ///   below for a regression case that would fail under the too-eager
 ///   "either side" rule).
 fn is_dead_end(query: Query, left: &Reg, right: &Reg) -> bool {
-    let left_dead = matches!(left.0.as_ref(), RegKind::Null);
-    let right_dead = matches!(right.0.as_ref(), RegKind::Null);
+    let left_dead = matches!(left.kind(), RegKind::Null);
+    let right_dead = matches!(right.kind(), RegKind::Null);
     match query {
         Query::Overlap => left_dead || right_dead,
         Query::Includes => left_dead,
@@ -673,23 +765,19 @@ impl RelationBackend for DerivativeBackend {
 /// A tiny lazily-built DFA over `Reg` residual states, keyed by small
 /// integer ids rather than by the residuals themselves.
 ///
-/// `match_brzozowski` used to cache transitions as `HashMap<(Reg, char),
-/// Reg>`: that avoids *recomputing* an already-seen transition, but every
-/// lookup still has to *hash* the current `Reg` to find it -- and hashing a
-/// `Reg` costs O(residual size), because `Rc<RegKind>: Hash` hashes the
-/// pointed-to tree, not the pointer. For patterns whose distinct-residual
-/// *count* stays small but whose individual residual *terms* stay large
-/// (wide alternation wrapped in an outer repetition is the common shape --
-/// see `docs/backends.md`'s antimirov section for why), that made every
-/// step of a long match walk pay a cost proportional to term size, even on
-/// a cache hit.
+/// `match_brzozowski` caches transitions as `HashMap<(usize, char),
+/// usize>`, not `HashMap<(Reg, char), Reg>`: the latter would still need
+/// to *hash* the current `Reg` on every lookup to find it, hit or miss.
+/// `Reg` is hash-consed (its hash is computed once, at construction, and
+/// cached -- see `compute_hash`), so that hashing is O(1), but it's still
+/// avoided here entirely in favor of comparing small integers, which is
+/// cheaper still and needs no hashing at all.
 ///
-/// Interning pays that hashing cost once per *distinct* residual, the
-/// first time it's seen; every revisit after that is a
-/// `(usize, char) -> usize` lookup, cheap regardless of how large the
-/// underlying residual is. This is the same "lazy DFA" technique real
-/// derivative-based regex engines use to make repeated/long matching fast
-/// without a separate upfront determinization pass.
+/// Interning means a revisited residual is a `(usize, char) -> usize`
+/// lookup, cheap regardless of how large the underlying residual is. This
+/// is the same "lazy DFA" technique real derivative-based regex engines
+/// use to make repeated/long matching fast without a separate upfront
+/// determinization pass.
 struct ResidualInterner {
     ids: HashMap<Reg, usize>,
     states: Vec<Reg>,
@@ -772,7 +860,7 @@ fn match_brzozowski(expr: &Expr, input: &str, config: &Config) -> BackendResult 
         };
         current = next;
         // Empty residual: no continuation can accept.
-        if matches!(interner.states[current].0.as_ref(), RegKind::Null) {
+        if matches!(interner.states[current].kind(), RegKind::Null) {
             break;
         }
     }
@@ -800,14 +888,6 @@ fn match_brzozowski(expr: &Expr, input: &str, config: &Config) -> BackendResult 
             witness_extraction_ms: 0,
         }
     }
-}
-
-// Silence unused Hasher import when Hash is derived only.
-#[allow(dead_code)]
-fn _hash_reg(r: &Reg) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    r.hash(&mut h);
-    h.finish()
 }
 
 #[cfg(test)]
@@ -1144,5 +1224,76 @@ mod tests {
         };
         let report = analyze_match_with_backend("ab", "ab", &config, &DerivativeBackend).unwrap();
         assert_eq!(report.verdict, Verdict::Unknown);
+    }
+
+    #[test]
+    fn dedup_is_order_independent_for_same_length_chains() {
+        // General regression guard for `Reg::alt`'s sort+dedup
+        // (independent of any particular `reg_ord` implementation):
+        // construction order must never affect the normalized result, and
+        // duplicates must always collapse.
+        //
+        // Build the same set of terms two different ways -- forwards and
+        // reversed -- and check `Reg::alt` produces the identical, fully
+        // deduplicated result regardless of input order. The terms are
+        // deliberately different-length chains of the same repeated
+        // element (the shape a `(a?)^n` derivative walk produces), since
+        // that shape is what past attempts at optimizing `reg_ord` for
+        // this codebase have touched -- this test is meant to survive
+        // whichever comparator implementation is in place.
+        fn chain(n: usize) -> Reg {
+            let opt_a = Reg::alt(vec![Reg::eps(), Reg::atom(CharSet::singleton('a'))]);
+            Reg::concat(vec![opt_a; n])
+        }
+        let forward: Vec<Reg> = (0..8).map(chain).collect();
+        let mut backward = forward.clone();
+        backward.reverse();
+        let mut with_dupes = forward.clone();
+        with_dupes.push(chain(3));
+        with_dupes.push(chain(3));
+        with_dupes.push(chain(0));
+
+        let a = Reg::alt(forward);
+        let b = Reg::alt(backward);
+        let c = Reg::alt(with_dupes);
+        assert_eq!(
+            a, b,
+            "order of construction must not affect the normalized form"
+        );
+        assert_eq!(
+            a, c,
+            "duplicate entries must still collapse to the same normalized form"
+        );
+        match a.kind() {
+            RegKind::Alt(parts) => assert_eq!(parts.len(), 8, "8 distinct chain lengths"),
+            other => panic!("expected a flattened Alt of 8 distinct terms, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_bounded_optional_chain_no_wrapping_star() {
+        // Correctness check on the actual shape of the
+        // `match_500_optional_*` bench files: N concatenated `a?`s with no
+        // outer `*`, i.e. a genuine bounded counter ("0 to N a's"), not a
+        // shape that collapses to few states. Kept small (N=60) so it's a
+        // fast, deterministic correctness check, independent of whatever
+        // the current performance characteristics of the real N=500 case
+        // happen to be (that's an open perf question -- see the
+        // `match_500_optional_*` bench investigation notes -- this test
+        // only guards correctness).
+        let pattern = "a?".repeat(60);
+        let config = Config::default();
+        let within =
+            analyze_match_with_backend(&pattern, &"a".repeat(40), &config, &DerivativeBackend)
+                .unwrap();
+        assert_eq!(within.verdict, Verdict::Yes);
+        let exact =
+            analyze_match_with_backend(&pattern, &"a".repeat(60), &config, &DerivativeBackend)
+                .unwrap();
+        assert_eq!(exact.verdict, Verdict::Yes);
+        let too_many =
+            analyze_match_with_backend(&pattern, &"a".repeat(61), &config, &DerivativeBackend)
+                .unwrap();
+        assert_eq!(too_many.verdict, Verdict::No);
     }
 }
