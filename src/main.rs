@@ -87,6 +87,12 @@ struct Cli {
     #[arg(long, value_enum, default_value = "automata", global = true)]
     backend: BackendArg,
 
+    /// Inner engine used by `--backend abstraction` for each CEGAR round and
+    /// for the concrete fall-back. Ignored for every other outer backend.
+    /// Defaults to `automata` (the historical behaviour).
+    #[arg(long = "abstraction-inner", value_enum, default_value = "automata", global = true)]
+    abstraction_inner: AbstractionInnerArg,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -112,11 +118,26 @@ enum BackendArg {
     Antimirov,
     /// Common-subexpression abstraction + CEGAR refinement. Replaces
     /// subexpressions shared verbatim by both patterns with a fresh marker,
-    /// runs `automata` on the shrunk pair, and trusts a resulting YES
-    /// outright; a NO or UNKNOWN falls back to `automata` on the original
-    /// patterns, so this never does worse and can do much better when the
-    /// two patterns share a large block.
+    /// runs the chosen inner backend (see `--abstraction-inner`) on the
+    /// shrunk pair, and trusts a resulting YES outright; a NO or UNKNOWN
+    /// falls back to the same inner on the original patterns. Never does
+    /// worse than the inner alone and can do much better when the two
+    /// patterns share a large block.
     Abstraction,
+}
+
+/// Concrete engine used inside `--backend abstraction`.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum AbstractionInnerArg {
+    /// On-the-fly product (default; matches historical `abstraction` behaviour).
+    #[default]
+    Automata,
+    /// Determinize + minimize, then product / isomorphism.
+    Minimized,
+    /// Brzozowski residual product.
+    Derivatives,
+    /// Antimirov partial-derivative product.
+    Antimirov,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -335,13 +356,22 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         return Ok(0);
     }
 
-    let abstraction_backend = AbstractionBackend::new();
-    let backend: &dyn RelationBackend = match cli.backend {
-        BackendArg::Automata => &AutomataBackend,
-        BackendArg::Minimized => &MinimizedBackend,
-        BackendArg::Derivatives => &DerivativeBackend,
-        BackendArg::Antimirov => &AntimirovBackend,
-        BackendArg::Abstraction => &abstraction_backend,
+    // Own the abstraction wrappers so their addresses stay valid for the
+    // subsequent analysis call. Only the selected one is actually used.
+    let abs_automata = AbstractionBackend::with_inner(AutomataBackend);
+    let abs_minimized = AbstractionBackend::with_inner(MinimizedBackend);
+    let abs_derivatives = AbstractionBackend::with_inner(DerivativeBackend);
+    let abs_antimirov = AbstractionBackend::with_inner(AntimirovBackend);
+
+    let backend: &dyn RelationBackend = match (cli.backend, cli.abstraction_inner) {
+        (BackendArg::Automata, _) => &AutomataBackend,
+        (BackendArg::Minimized, _) => &MinimizedBackend,
+        (BackendArg::Derivatives, _) => &DerivativeBackend,
+        (BackendArg::Antimirov, _) => &AntimirovBackend,
+        (BackendArg::Abstraction, AbstractionInnerArg::Automata) => &abs_automata,
+        (BackendArg::Abstraction, AbstractionInnerArg::Minimized) => &abs_minimized,
+        (BackendArg::Abstraction, AbstractionInnerArg::Derivatives) => &abs_derivatives,
+        (BackendArg::Abstraction, AbstractionInnerArg::Antimirov) => &abs_antimirov,
     };
 
     let mut report = match command {

@@ -326,11 +326,9 @@ pub struct AbstractionBackend<B: RelationBackend> {
 }
 
 impl AbstractionBackend<crate::analysis::AutomataBackend> {
+    /// Convenience constructor: CEGAR over the default automata backend.
     pub fn new() -> Self {
-        Self {
-            inner: crate::analysis::AutomataBackend,
-            max_abstractions: 8,
-        }
+        Self::with_inner(crate::analysis::AutomataBackend)
     }
 }
 
@@ -340,8 +338,30 @@ impl Default for AbstractionBackend<crate::analysis::AutomataBackend> {
     }
 }
 
+impl<B: RelationBackend> AbstractionBackend<B> {
+    /// Build a CEGAR driver that delegates abstract rounds and the concrete
+    /// fall-back to `inner`. Uses the default abstraction budget (8).
+    pub fn with_inner(inner: B) -> Self {
+        Self {
+            inner,
+            max_abstractions: 8,
+        }
+    }
+
+    /// Like [`with_inner`] but with an explicit initial abstraction budget.
+    pub fn with_inner_and_budget(inner: B, max_abstractions: usize) -> Self {
+        Self {
+            inner,
+            max_abstractions,
+        }
+    }
+}
+
 impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
     fn name(&self) -> &'static str {
+        // Stable short label so existing tests / JSON consumers that key on
+        // "abstraction" keep working. The concrete inner is chosen at
+        // construction time (`with_inner` / CLI `--abstraction-inner`).
         "abstraction"
     }
 
@@ -581,7 +601,7 @@ mod tests {
         let cfg = Config {
             timeout_ms: 50,
             max_product_states: 200_000,
-            ..Default::default()
+            ..Config::default()
         };
         let backend = AbstractionBackend::new();
         let started = Instant::now();
@@ -612,5 +632,22 @@ mod tests {
             analyze_binary_with_backend(Query::Equivalent, "a(bc)*d", "a(bc)*e", &cfg, &backend)
                 .unwrap();
         assert_eq!(report.verdict, Verdict::No);
+    }
+
+    #[test]
+    fn with_inner_derivatives_agrees_on_shared_block() {
+        // Library API: CEGAR over Brzozowski residuals instead of automata.
+        let cfg = Config::default();
+        let backend = AbstractionBackend::with_inner(crate::derivative::DerivativeBackend);
+        let report = analyze_binary_with_backend(
+            Query::Overlap,
+            "((a|b){8}c){3}x",
+            "((a|b){8}c){3}x",
+            &cfg,
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert_eq!(report.backend.name, "abstraction");
     }
 }

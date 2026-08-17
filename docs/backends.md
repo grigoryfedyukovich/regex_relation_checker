@@ -2,11 +2,12 @@
 
 `regexrel` implements five engines behind one CLI and library API. Select
 with `--backend <name>`. Four are fully independent decision procedures and
-must agree on every completed `YES` / `NO`; the fifth, `abstraction`,
-delegates to `automata` (running it on a reduced problem, or, once
-refinement bottoms out, on the original patterns unchanged), so its verdicts
-are only as independent as `automata`'s — but it carries its own soundness
-argument for the fast path, and its own witness-replay check, on top.
+must agree on every completed `YES` / `NO`; the fifth, `abstraction`, is a
+CEGAR driver that delegates each abstract round *and* the concrete fall-back
+to a configurable inner engine (default: `automata`; override with
+`--abstraction-inner`). Its verdicts are only as independent as that
+inner's — but it carries its own soundness argument for the fast path, and
+its own witness-replay check, on top.
 Disagreement among the four independent engines is a bug; `UNKNOWN` means a
 resource limit was hit, not a soft “maybe”.
 
@@ -16,7 +17,7 @@ resource limit was hit, not a soft “maybe”.
 | `minimized` | `minimize.rs` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
-| `abstraction` | `abstraction.rs` | Common-subexpression CEGAR reduction, delegating to `automata` |
+| `abstraction` | `abstraction.rs` | Common-subexpression CEGAR; inner via `--abstraction-inner` |
 
 Cross-checking the four independent engines is intentional: a defect that is
 local to one implementation is far more likely to surface as a backend
@@ -207,22 +208,24 @@ alternation where residual *sets* stay narrow; research comparisons on the
    Use Area, disjoint from the ordinary alphabet.
 3. Rewrite both ASTs, replacing every occurrence of each chosen
    subexpression — wherever it appears, in either pattern — with its
-   marker. Run `automata` on the resulting, much smaller pair.
+   marker. Run the configured *inner* backend (default `automata`; set
+   with `--abstraction-inner`) on the resulting, much smaller pair.
 4. **Sound YES** (Includes/Equivalent: abstract search exhausted with no
    counterexample; Overlap: abstract search found a match) is accepted
    immediately. For Overlap, every marker in the returned witness is first
    expanded back into a genuine shortest string drawn from the language of
-   the subexpression it stands for (another `automata` search, on just that
-   subexpression) before the witness is trusted or returned; if a marker
-   turns out to stand for a subexpression with an *empty* language, no
-   substitution exists, and the round is treated as inconclusive rather
+   the subexpression it stands for (another inner-backend search, on just
+   that subexpression) before the witness is trusted or returned; if a
+   marker turns out to stand for a subexpression with an *empty* language,
+   no substitution exists, and the round is treated as inconclusive rather
    than trusted.
 5. **Abstract NO / UNKNOWN** is never trusted directly. The distinguishing
    counterexample (if any) tells the driver which marker(s) to expand back
    into their real subexpression, and it retries. After
    `MAX_REFINEMENT_ROUNDS`, or once nothing is left to expand, it falls
-   back to running `automata` on the *original*, fully concrete patterns —
-   the same procedure `--backend automata` would have run from the start.
+   back to running the same inner backend on the *original*, fully concrete
+   patterns — the same procedure `--backend <inner>` would have run from
+   the start.
 6. All of the above — every abstracted round, every witness-expansion
    lookup, and the final concrete fallback — share **one** deadline,
    measured from the start of the call: each gets whatever is left of the
@@ -301,15 +304,39 @@ characters). Relation queries on the same pattern explore Θ(2ⁿ) product state
 Hitting either yields **`UNKNOWN`**, never a guessed `YES`/`NO`. Witnesses
 from completed runs are replayed on both sides before being returned.
 
-`abstraction` can make several internal `automata` calls per query (one per
-CEGAR round, plus witness expansion, plus a possible concrete fallback); all
-of them share the *one* `timeout_ms` budget the caller configured, measured
-from the start of the query — an individual round never gets a fresh full
-timeout of its own. `max_product_states`, by contrast, is currently applied
-fresh to each internal call rather than shared cumulatively; in the worst
-case a query can visit somewhat more than `max_product_states` product
-states in total across all of `abstraction`'s rounds, though each round
-individually still respects the cap.
+`abstraction` can make several internal calls to its *inner* backend per
+query (one per CEGAR round, plus witness expansion, plus a possible concrete
+fallback); all of them share the *one* `timeout_ms` budget the caller
+configured, measured from the start of the query — an individual round never
+gets a fresh full timeout of its own. `max_product_states`, by contrast, is
+currently applied fresh to each internal call rather than shared
+cumulatively; in the worst case a query can visit somewhat more than
+`max_product_states` product states in total across all of `abstraction`'s
+rounds, though each round individually still respects the cap.
+
+The inner engine is selected independently of the outer flag:
+
+```bash
+# historical default (inner = automata)
+./target/release/regexrel --backend abstraction ...
+
+# CEGAR over Brzozowski residuals
+./target/release/regexrel --backend abstraction --abstraction-inner derivatives ...
+
+# CEGAR over Antimirov / minimized
+./target/release/regexrel --backend abstraction --abstraction-inner antimirov ...
+./target/release/regexrel --backend abstraction --abstraction-inner minimized ...
+```
+
+Library users construct the driver directly:
+
+```rust
+use regexrel::{AbstractionBackend, DerivativeBackend, RelationBackend};
+
+let backend = AbstractionBackend::with_inner(DerivativeBackend);
+// or with an explicit budget:
+let backend = AbstractionBackend::with_inner_and_budget(DerivativeBackend, 12);
+```
 
 ---
 
@@ -322,13 +349,16 @@ star / optional chains    →  derivatives  (and compare)
 nth-from-end / windows    →  any may UNKNOWN; needs new methods
 agreement testing         →  run all four independent engines, require identical verdicts
 wide alternation residuals→  antimirov (compare to derivatives)
-large shared block        →  abstraction (falls back to automata if it can't help)
+large shared block        →  abstraction (inner defaults to automata;
+                             try --abstraction-inner derivatives/antimirov
+                             when the residual space of the *shrunk* pair is small)
 ```
 
 ```bash
 ./target/release/regexrel --backend automata    --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend minimized   --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend derivatives --stats equivalent 'a+' 'aa*'
+./target/release/regexrel --backend abstraction --abstraction-inner derivatives --stats equivalent 'a+' 'aa*'
 ```
 
 Benchmark driver:
