@@ -7,7 +7,8 @@ use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
-    AntimirovBackend, AutomataBackend, DerivativeBackend, MinimizedBackend, Query, RelationBackend,
+    AbstractionBackend, AntimirovBackend, AutomataBackend, DerivativeBackend, MinimizedBackend,
+    Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -109,6 +110,13 @@ enum BackendArg {
     /// Brzozowski, but the set representation maps more directly to NFA
     /// states and can stay smaller under alternation.
     Antimirov,
+    /// Common-subexpression abstraction + CEGAR refinement. Replaces
+    /// subexpressions shared verbatim by both patterns with a fresh marker,
+    /// runs `automata` on the shrunk pair, and trusts a resulting YES
+    /// outright; a NO or UNKNOWN falls back to `automata` on the original
+    /// patterns, so this never does worse and can do much better when the
+    /// two patterns share a large block.
+    Abstraction,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -327,11 +335,13 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         return Ok(0);
     }
 
+    let abstraction_backend = AbstractionBackend::new();
     let backend: &dyn RelationBackend = match cli.backend {
         BackendArg::Automata => &AutomataBackend,
         BackendArg::Minimized => &MinimizedBackend,
         BackendArg::Derivatives => &DerivativeBackend,
         BackendArg::Antimirov => &AntimirovBackend,
+        BackendArg::Abstraction => &abstraction_backend,
     };
 
     let mut report = match command {

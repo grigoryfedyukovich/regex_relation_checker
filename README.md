@@ -5,7 +5,7 @@ regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
 a relation fails or overlap succeeds, it emits a **shortest** constructive
 witness.
 
-Four interchangeable analysis engines implement the same contract:
+Five interchangeable analysis engines implement the same contract:
 
 | `--backend` | Technique |
 |-------------|-----------|
@@ -13,6 +13,7 @@ Four interchangeable analysis engines implement the same contract:
 | `minimized` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | Brzozowski residuals + residual-pair product |
 | `antimirov` | Antimirov partial derivatives (linear forms) + product BFS |
+| `abstraction` | Common-subexpression CEGAR reduction, delegating to `automata` |
 
 Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
 state or time limit yields **`UNKNOWN`**, never a guessed verdict. Details:
@@ -74,10 +75,28 @@ Antimirov **partial** derivatives: each step yields a finite *set* of residuals
 (a linear form). Same residual language as Brzozowski, but the set form maps
 more directly to NFA states and can stay smaller under alternation.
 
+### `abstraction` (CEGAR)
+
+Finds subexpressions that occur **structurally identically** in both
+patterns, replaces every occurrence of each with the same fresh marker
+symbol, and runs `automata` on the shrunk pair. A sound `YES` on the
+abstracted pair (after expanding the marker back into a real substring)
+proves the concrete `YES` outright — often from a product orders of
+magnitude smaller. An abstract `NO`/`UNKNOWN` is never trusted directly: it
+triggers counterexample-guided refinement, and after a bounded number of
+rounds falls back to running `automata` on the original, unabstracted
+patterns. So it never does worse than `automata`, and can do dramatically
+better when the two patterns share large structure and the answer is `YES`.
+
+```bash
+./target/release/regexrel --backend abstraction --stats bench/yes/mega_cegar_overlap__shared-core.md
+# YES, product=2 states (vs. product=512 for --backend automata on the same pair)
+```
+
 Compare engines on the same input:
 
 ```bash
-for b in automata minimized derivatives antimirov; do
+for b in automata minimized derivatives antimirov abstraction; do
   echo "== $b =="
   ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
 done
@@ -107,7 +126,9 @@ regexrel --backend derivatives bench/yes/equivalent__a-or-a_vs_a.md
 
 Prefixes: plain smoke tests; `heavy_` / `stress_` larger counts; `mega_`
 hundreds of quantifiers or **exponential / window** languages (research
-targets that may hit `UNKNOWN` under default limits).
+targets that may hit `UNKNOWN` under default limits); `mega_cegar_` a `mega_`
+subfamily built around a large subexpression shared verbatim by both
+patterns — the case `--backend abstraction` targets.
 
 Runner (from repo root):
 

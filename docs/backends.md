@@ -1,9 +1,14 @@
 # Analysis backends
 
-`regexrel` implements four independent engines behind one CLI and library API.
-Select with `--backend <name>`. All four decide the same regular subset and
-must agree on every completed `YES` / `NO`. Disagreement is a bug; `UNKNOWN`
-means a resource limit was hit, not a soft “maybe”.
+`regexrel` implements five engines behind one CLI and library API. Select
+with `--backend <name>`. Four are fully independent decision procedures and
+must agree on every completed `YES` / `NO`; the fifth, `abstraction`,
+delegates to `automata` (running it on a reduced problem, or, once
+refinement bottoms out, on the original patterns unchanged), so its verdicts
+are only as independent as `automata`'s — but it carries its own soundness
+argument for the fast path, and its own witness-replay check, on top.
+Disagreement among the four independent engines is a bug; `UNKNOWN` means a
+resource limit was hit, not a soft “maybe”.
 
 | Flag value | Module | Core technique |
 |------------|--------|----------------|
@@ -11,12 +16,18 @@ means a resource limit was hit, not a soft “maybe”.
 | `minimized` | `minimize.rs` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
+| `abstraction` | `abstraction.rs` | Common-subexpression CEGAR reduction, delegating to `automata` |
 
-Cross-checking all four is intentional: a defect that is local to one
-implementation is far more likely to surface as a backend disagreement than
-as a silent shared wrong answer. Integration tests in `tests/backend_agreement.rs`
-exercise this across all four backends (`automata`, `minimized`, `derivatives`,
-`antimirov`) on every `cargo test` run.
+Cross-checking the four independent engines is intentional: a defect that is
+local to one implementation is far more likely to surface as a backend
+disagreement than as a silent shared wrong answer. Integration tests in
+`tests/backend_agreement.rs` exercise this across those four backends
+(`automata`, `minimized`, `derivatives`, `antimirov`) on every `cargo test`
+run. `abstraction` is not yet in that differential-fuzzing loop (it has its
+own targeted unit tests in `abstraction.rs` instead, plus every returned
+witness is replayed against the concrete, unabstracted automata before it
+can reach the caller) — adding it to `backend_agreement.rs` is open
+follow-up work.
 
 ---
 
@@ -180,8 +191,97 @@ alternation where residual *sets* stay narrow; research comparisons on the
 ./bench/run.sh --keep-going "--backend antimirov --max-states 1000000 --timeout-ms 60000"
 ```
 
-## Concrete membership: `match`
+---
 
+## 5. `abstraction` — CEGAR common-subexpression reduction
+
+**Pipeline**
+
+1. Walk both ASTs and collect every subexpression, keyed by a *structural*
+   signature (kind + children, independent of source span). A candidate is
+   worth abstracting once it's large enough (`MIN_ABSTRACT_SIZE`) and its
+   signature appears in **both** patterns.
+2. Rank candidates largest-first (ties broken by structural key, so the
+   choice is deterministic across runs), keep up to `max_abstractions` of
+   them, and assign each a fresh marker character from the Unicode Private
+   Use Area, disjoint from the ordinary alphabet.
+3. Rewrite both ASTs, replacing every occurrence of each chosen
+   subexpression — wherever it appears, in either pattern — with its
+   marker. Run `automata` on the resulting, much smaller pair.
+4. **Sound YES** (Includes/Equivalent: abstract search exhausted with no
+   counterexample; Overlap: abstract search found a match) is accepted
+   immediately. For Overlap, every marker in the returned witness is first
+   expanded back into a genuine shortest string drawn from the language of
+   the subexpression it stands for (another `automata` search, on just that
+   subexpression) before the witness is trusted or returned; if a marker
+   turns out to stand for a subexpression with an *empty* language, no
+   substitution exists, and the round is treated as inconclusive rather
+   than trusted.
+5. **Abstract NO / UNKNOWN** is never trusted directly. The distinguishing
+   counterexample (if any) tells the driver which marker(s) to expand back
+   into their real subexpression, and it retries. After
+   `MAX_REFINEMENT_ROUNDS`, or once nothing is left to expand, it falls
+   back to running `automata` on the *original*, fully concrete patterns —
+   the same procedure `--backend automata` would have run from the start.
+6. All of the above — every abstracted round, every witness-expansion
+   lookup, and the final concrete fallback — share **one** deadline,
+   measured from the start of the call: each gets whatever is left of the
+   caller's configured `timeout_ms`, not a fresh full budget per round.
+
+**Soundness, briefly**
+
+Replacing a subexpression `S` by a fresh marker `σ` (consistently, in both
+patterns) is a language substitution `h` with `h(σ) = L(S)`. This gives
+`L(A) = h(L(A'))` unconditionally, and `h` is monotonic under subset — so an
+abstract `YES` on Includes/Equivalent always implies the concrete `YES`. An
+abstract `YES` on Overlap needs one more step (the witness must be
+expandable into a real string), which is exactly what step 4 checks.
+
+**Strengths**
+
+- When the two patterns share a large block verbatim, the reduced product
+  can be *orders of magnitude* smaller than the concrete one. On
+  `bench/yes/mega_cegar_overlap__shared-core.md` (`((a|b){25}c){10}x` vs.
+  itself), `abstraction` visits 2 product states where `automata` visits
+  512; several of the `mega_cegar_*` cases show a similar 100–250x
+  reduction.
+- Strictly bounded downside: every fallback path re-runs `automata`
+  unmodified, so a case `abstraction` can't shortcut costs at most a small,
+  now timeout-budget-respecting constant more than running `automata`
+  directly.
+
+**Weaknesses**
+
+- Only the `YES` side benefits. A real `NO` is never provable in abstract
+  space (an abstract `NO` is definitionally inconclusive), so refinement
+  always runs to completion and the concrete fallback does the same work
+  `automata` alone would have — plus the abstracted round(s)' overhead.
+  Measured overhead on the `mega_cegar_*` `NO` cases is small (single-digit
+  milliseconds) but nonzero.
+- No shared structure, no benefit: patterns that are simply different in
+  shape (the nth-from-end family `(a|b)*a(a|b){n}` vs. an unrelated
+  right-hand side, for example) have nothing for this technique to grab
+  onto, and `abstraction` degenerates to plain `automata` with no
+  meaningful overhead.
+- Unlike the other four engines, it is not currently exercised by
+  `tests/backend_agreement.rs`'s differential fuzzing (see the note in the
+  overview above).
+
+**When to use**
+
+Two patterns you already expect to share a large common block — generated
+or templated regexes, a proposed edit to one branch of a larger shared
+grammar, schema migrations that reuse most of a pattern and change one
+piece. Comparing an unmodified pattern against a near-duplicate is the
+sweet spot.
+
+```bash
+./target/release/regexrel --backend abstraction --stats \
+  bench/yes/mega_cegar_overlap__shared-core.md
+./bench/run.sh --keep-going "--backend abstraction --max-states 1000000 --timeout-ms 60000"
+```
+
+## Concrete membership: `match`
 `regexrel match <regex> <string>` is full-string membership. The default path
 simulates the NFA along the input. **Derivative** and **Antimirov** backends
 override `match_input` to walk residuals character-by-character with memoization.
@@ -201,6 +301,16 @@ characters). Relation queries on the same pattern explore Θ(2ⁿ) product state
 Hitting either yields **`UNKNOWN`**, never a guessed `YES`/`NO`. Witnesses
 from completed runs are replayed on both sides before being returned.
 
+`abstraction` can make several internal `automata` calls per query (one per
+CEGAR round, plus witness expansion, plus a possible concrete fallback); all
+of them share the *one* `timeout_ms` budget the caller configured, measured
+from the start of the query — an individual round never gets a fresh full
+timeout of its own. `max_product_states`, by contrast, is currently applied
+fresh to each internal call rather than shared cumulatively; in the worst
+case a query can visit somewhat more than `max_product_states` product
+states in total across all of `abstraction`'s rounds, though each round
+individually still respects the cap.
+
 ---
 
 ## Choosing a backend (practical)
@@ -210,8 +320,9 @@ small / unknown shape     →  automata (default)
 equivalence of "same-ish" →  minimized
 star / optional chains    →  derivatives  (and compare)
 nth-from-end / windows    →  any may UNKNOWN; needs new methods
-agreement testing         →  run all four, require identical verdicts
+agreement testing         →  run all four independent engines, require identical verdicts
 wide alternation residuals→  antimirov (compare to derivatives)
+large shared block        →  abstraction (falls back to automata if it can't help)
 ```
 
 ```bash

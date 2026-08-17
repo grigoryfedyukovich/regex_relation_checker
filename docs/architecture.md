@@ -9,11 +9,12 @@ parser (hand-written) → AST
     ↓
 Thompson NFA build          ─┐
     ↓                        │  derivatives also consume AST
-RelationBackend              │
-  • automata  (default)      │
+RelationBackend               │  abstraction rewrites the AST, then
+  • automata  (default)      │  delegates to automata
   • minimized                │
   • derivatives               │
   • antimirov   ←────────────┘
+  • abstraction  (wraps automata)
     ↓
 Report (text or JSON) + optional shortest witness
 ```
@@ -30,6 +31,7 @@ Report (text or JSON) + optional shortest witness
 | `minimize` | **minimized** backend: determinize, Moore minimize, isomorphism / DFA product |
 | `derivative` | **derivatives** backend: residual algebra + residual-pair product |
 | `antimirov` | **antimirov** backend: partial derivatives (linear forms) + product |
+| `abstraction` | **abstraction** backend: common-subexpression CEGAR reduction, delegates to **automata** |
 | `config` | TOML + CLI overrides; validated limits |
 | `report` | Verdicts, witnesses, timings, JSON schema v1 |
 
@@ -41,14 +43,20 @@ layer maps that into a user-facing `Verdict` (`YES` / `NO` / `UNKNOWN` /
 `UNSUPPORTED`), validates witnesses by independent replay, and fills timings.
 
 AST-aware entry points (`analyze_binary_expr` / `analyze_empty_expr`) let the
-derivatives backend avoid a pure-NFA path; other backends ignore the AST and
-use the NFAs.
+derivatives backend avoid a pure-NFA path, and let the abstraction backend
+rewrite the AST (structurally-shared subexpressions → fresh marker symbols)
+before building NFAs at all; other backends ignore the AST and use the NFAs
+directly.
 
 ## Determinism
 
 - Alphabet partitions are split at every relevant interval endpoint.
 - The lowest Unicode scalar in each partition is explored first.
 - Witnesses are shortest by codepoint count under that policy.
+- `abstraction`'s choice of which structurally-shared subexpressions to
+  abstract is ranked largest-first with a deterministic tiebreak on
+  structural key, independent of hash-map iteration order, so the same
+  input always produces the same abstraction and the same witness.
 
 ## Failure modes
 

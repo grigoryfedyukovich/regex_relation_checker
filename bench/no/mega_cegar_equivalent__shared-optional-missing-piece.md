@@ -1,0 +1,2 @@
+# equivalent NO: long optional chain missing one piece on the right
+equivalent '(ab)?(cd)?(ef)?(gh)?(ij)?(kl)?(mn)?(op)?(qr)?(st)?z' '(ab)?(cd)?(ef)?(gh)?(ij)?(kl)?(mn)?(op)?(qr)?z'

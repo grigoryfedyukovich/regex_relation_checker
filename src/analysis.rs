@@ -408,7 +408,7 @@ fn search_product(query: Query, left: &Nfa, right: &Nfa, config: &Config) -> Bac
     )
 }
 
-fn search_single(nfa: &Nfa, config: &Config) -> BackendResult {
+pub(crate) fn search_single(nfa: &Nfa, config: &Config) -> BackendResult {
     let started = Instant::now();
     let deadline = Duration::from_millis(config.timeout_ms);
     let initial = SubsetKey(nfa.start_subset());
