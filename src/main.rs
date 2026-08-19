@@ -90,7 +90,12 @@ struct Cli {
     /// Inner engine used by `--backend abstraction` for each CEGAR round and
     /// for the concrete fall-back. Ignored for every other outer backend.
     /// Defaults to `automata` (the historical behaviour).
-    #[arg(long = "abstraction-inner", value_enum, default_value = "automata", global = true)]
+    #[arg(
+        long = "abstraction-inner",
+        value_enum,
+        default_value = "automata",
+        global = true
+    )]
     abstraction_inner: AbstractionInnerArg,
 
     #[command(subcommand)]
