@@ -106,14 +106,26 @@ fn representative_symbols(sets: &[&CharSet]) -> Vec<char> {
 /// `(start, end, representative)` for each partition class instead of just
 /// the representative -- needed when materializing full DFA transitions
 /// rather than just picking one character to test per class.
+///
+/// Unlike `representative_symbols`, this pairs up *adjacent* boundaries via
+/// `windows(2)` to recover each range, so it needs a boundary *after* the
+/// last interval it cares about, not just at its start. `representative_symbols`
+/// (and the sibling `representative_chars` copies in `analysis.rs`,
+/// `derivative.rs`, `antimirov.rs`) only ever test boundary points for set
+/// membership directly, so an interval ending at `0x10ffff` needs no boundary
+/// past its start there -- but here, omitting it left the last boundary
+/// unpaired, silently dropping the whole top range (anything from that
+/// boundary through `0x10ffff`) from the returned partition, and so from the
+/// DFA transitions built from it. Always pushing the sentinel fixes that; the
+/// sentinel itself (`0x110000`) is one past the last valid scalar value and
+/// is only ever consumed as a window's `end`, never converted via
+/// `char::from_u32`, so it doesn't need the same validity guard `start` does.
 fn alphabet_partition(sets: &[&CharSet]) -> Vec<(u32, u32, char)> {
     let mut boundaries: Vec<u32> = Vec::new();
     for set in sets {
         for interval in set.intervals() {
             boundaries.push(interval.start);
-            if interval.end < 0x10ffff {
-                boundaries.push(interval.end + 1);
-            }
+            boundaries.push(interval.end + 1);
         }
     }
     boundaries.sort_unstable();
@@ -709,10 +721,12 @@ mod tests {
     use crate::report::Verdict;
 
     fn both_agree(query: Query, left: &str, right: &str) {
-        let config = Config::default();
-        let a = analyze_binary_with_backend(query, left, right, &config, &AutomataBackend).unwrap();
-        let b =
-            analyze_binary_with_backend(query, left, right, &config, &MinimizedBackend).unwrap();
+        both_agree_with_config(&Config::default(), query, left, right);
+    }
+
+    fn both_agree_with_config(config: &Config, query: Query, left: &str, right: &str) {
+        let a = analyze_binary_with_backend(query, left, right, config, &AutomataBackend).unwrap();
+        let b = analyze_binary_with_backend(query, left, right, config, &MinimizedBackend).unwrap();
         assert_eq!(
             a.verdict, b.verdict,
             "backends disagree on {:?}({:?}, {:?}): automata={:?} minimized={:?}",
@@ -751,6 +765,64 @@ mod tests {
                 both_agree(query, left, right);
             }
         }
+    }
+
+    #[test]
+    fn alphabet_partition_covers_a_range_ending_at_the_last_scalar_value() {
+        // Regression guard: `alphabet_partition` used to add a boundary
+        // *after* an interval's end only when `end < 0x10ffff`, so an
+        // interval ending exactly at the top of the Unicode range got no
+        // trailing boundary. Since this function recovers ranges by pairing
+        // *adjacent* boundaries with `windows(2)`, that left the interval's
+        // own boundary unpaired -- silently dropping the whole top range
+        // from the returned partition (and so from the DFA transitions
+        // built from it), even though the interval itself was well-formed.
+        let set = CharSet::from_u32_intervals(vec![Interval::new(0x10fffe, 0x10ffff)]);
+        let partition = alphabet_partition(&[&set]);
+        assert_eq!(
+            partition,
+            vec![(0x10fffe, 0x10ffff, char::from_u32(0x10fffe).unwrap())],
+            "range ending at U+10FFFF must survive the partition, not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn agrees_with_automata_backend_on_unicode_boundary_ranges() {
+        // Same regression as `alphabet_partition_covers_a_range_ending_at_the_last_scalar_value`,
+        // exercised end-to-end through both backends rather than the helper
+        // directly -- this is the shape of query that originally surfaced
+        // the bug (a class or `.` whose compiled range runs up to U+10FFFF).
+        let config = Config {
+            alphabet: crate::config::Alphabet::Unicode,
+            ..Config::default()
+        };
+        let max = '\u{10ffff}';
+        let e000 = '\u{e000}';
+
+        // `.` denotes the whole alphabet minus newline, which -- under
+        // `--alphabet unicode` -- includes U+E000..U+10FFFF. A pattern that
+        // explicitly excludes exactly that trailing block is therefore
+        // *not* equivalent to `.`; the buggy `minimized` backend disagreed
+        // (it saw `.` as if it stopped short of U+10FFFF too, matching the
+        // excluded pattern by coincidence).
+        let excludes_top_block = format!("[^\n{e000}-{max}]");
+        both_agree_with_config(&config, Query::Equivalent, ".", &excludes_top_block);
+        both_agree_with_config(&config, Query::Includes, &excludes_top_block, ".");
+
+        // A class whose only member is the maximum scalar value.
+        let singleton_max = format!("[{max}]");
+        let a = analyze_empty_with_backend(&singleton_max, &config, &AutomataBackend).unwrap();
+        let b = analyze_empty_with_backend(&singleton_max, &config, &MinimizedBackend).unwrap();
+        assert_eq!(
+            a.verdict, b.verdict,
+            "empty({singleton_max:?}) disagreement"
+        );
+        assert_eq!(a.verdict, Verdict::No, "a singleton class is never empty");
+
+        // A range from an ASCII literal up through the maximum scalar value.
+        let a_to_max = format!("[a-{max}]");
+        both_agree_with_config(&config, Query::Overlap, &a_to_max, &singleton_max);
+        both_agree_with_config(&config, Query::Includes, &singleton_max, &a_to_max);
     }
 
     #[test]
