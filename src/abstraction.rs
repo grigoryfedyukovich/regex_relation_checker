@@ -4,6 +4,15 @@
 //! - Abstract YES for Equivalent / Includes / Overlap / Empty ⇒ concrete YES.
 //! - Abstract NO is inconclusive and triggers refinement or fall-back.
 //!
+//! The homomorphism argument requires each fresh marker `σ` to satisfy
+//! `σ ∉ Σ` (the configured alphabet) -- otherwise `σ` is just an ordinary
+//! character, and a real occurrence of it anywhere in either pattern
+//! collides with the substitution, breaking the `h(σ) = L(S)` argument the
+//! rest of this module relies on. `Alphabet::Unicode`'s declared scalar
+//! range is every valid Unicode scalar value there is, so it leaves no `σ`
+//! free; see `alphabet_has_room_for_markers`, checked once per call before
+//! any abstraction is attempted.
+//!
 //! Strategy:
 //! 1. Collect structurally identical subexpressions that appear in both ASTs.
 //! 2. Replace the largest ones by fresh letters (outside the active alphabet).
@@ -13,13 +22,17 @@
 //!    retry. After a fixed budget, fall back to the concrete inner analysis.
 
 use crate::analysis::{BackendResult, BackendStatus, Query, RelationBackend};
-use crate::ast::{Expr, ExprKind};
-use crate::config::Config;
+use crate::ast::{Expr, ExprKind, Span};
+use crate::charset::{CharSet, Interval};
+use crate::config::{Alphabet, Config};
 use crate::nfa::Nfa;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-/// Private-use area start; safely outside ASCII and the BMP surrogates.
+/// Private-use area start. Markers are ordinary `char` literals drawn
+/// upward from here, so they are only actually fresh -- disjoint from every
+/// pattern's real characters -- when the configured alphabet's scalar range
+/// stops below this point. See `alphabet_has_room_for_markers`.
 const FRESH_BASE: u32 = 0xE000;
 
 /// Maximum CEGAR refinement rounds before falling back to the concrete backend.
@@ -27,6 +40,29 @@ const MAX_REFINEMENT_ROUNDS: usize = 4;
 
 /// Minimum structural size for a subexpression to be worth abstracting.
 const MIN_ABSTRACT_SIZE: usize = 3;
+
+/// Whether `alphabet` leaves any scalar value free for a marker.
+///
+/// Markers are encoded as ordinary `char` literals starting at
+/// `FRESH_BASE` and counting upward (`build_initial_map`), so this checks
+/// whether `alphabet`'s own declared scalar range (`Alphabet::scalar_intervals`)
+/// reaches into `FRESH_BASE..=0x10FFFF` at all -- if it does, some marker
+/// value collides with a real character *of that same alphabet*, and no
+/// choice of marker in that range is actually outside `Σ`.
+///
+/// `Alphabet::Ascii` tops out at `U+007F`, well below `FRESH_BASE`, so the
+/// whole marker range is free. `Alphabet::Unicode`'s range is `U+0000..U+D7FF`
+/// ∪ `U+E000..U+10FFFF` -- precisely the set of every value a Rust `char` can
+/// hold, since surrogates are excluded from both `char` and this alphabet
+/// for the same reason -- so it overlaps the marker range entirely and
+/// leaves nothing free. This is computed against the actual declared range
+/// rather than hard-coded per variant, so a future alphabet is checked by
+/// the same rule instead of silently defaulting to "safe".
+fn alphabet_has_room_for_markers(alphabet: Alphabet) -> bool {
+    let universe = CharSet::from_u32_intervals(alphabet.scalar_intervals().to_vec());
+    let marker_region = CharSet::from_u32_intervals(vec![Interval::new(FRESH_BASE, 0x10ffff)]);
+    universe.intersect(&marker_region).is_empty()
+}
 
 /// Score used to prefer large / expensive common subexpressions.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -94,9 +130,36 @@ fn normalize(expr: &Expr) -> Expr {
     }
 }
 
-/// Structural key for common-subexpression discovery (ignores spans).
+/// Structural key for common-subexpression discovery and matching (ignores
+/// spans -- see `zero_spans`).
 fn structural_key(expr: &Expr) -> String {
-    format!("{:?}", expr.kind)
+    format!("{:?}", zero_spans(expr).kind)
+}
+
+/// Clone of `expr` with every span -- this node's own and every
+/// descendant's -- reset to a canonical value.
+///
+/// `structural_key` only ever formats `.kind`, never the whole `Expr`, so
+/// this node's *own* span was already excluded -- but `ExprKind::Concat`,
+/// `Alt`, and `Repeat` all embed full child `Expr` values (kind *and*
+/// span), and a derived `Debug` impl formats those recursively. Without
+/// this, two structurally-identical subexpressions occurring at different
+/// byte offsets in the source text -- the common case for any subexpression
+/// repeated more than once in a pattern -- would carry different span
+/// values down through their descendants and so produce different keys,
+/// silently failing to match despite being the exact same shape.
+fn zero_spans(expr: &Expr) -> Expr {
+    let kind = match &expr.kind {
+        ExprKind::Concat(parts) => ExprKind::Concat(parts.iter().map(zero_spans).collect()),
+        ExprKind::Alt(parts) => ExprKind::Alt(parts.iter().map(zero_spans).collect()),
+        ExprKind::Repeat { expr, min, max } => ExprKind::Repeat {
+            expr: Box::new(zero_spans(expr)),
+            min: *min,
+            max: *max,
+        },
+        other => other.clone(),
+    };
+    Expr::new(kind, Span::new(0, 0))
 }
 
 /// Collect every subexpression (post-normalisation) together with its size.
@@ -394,6 +457,29 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
         config: &Config,
     ) -> BackendResult {
         let started = Instant::now();
+
+        if !alphabet_has_room_for_markers(config.alphabet) {
+            // No scalar value is free for a marker under this alphabet (see
+            // `alphabet_has_room_for_markers`), so any abstraction here
+            // could substitute a marker that collides with a real
+            // character occurring in either pattern -- the homomorphism
+            // argument this module relies on no longer holds. Skip
+            // straight to concrete analysis rather than risk trusting an
+            // unsound abstract YES; this is the same fallback path used
+            // below when there's nothing to abstract or refinement is
+            // exhausted.
+            let left_nfa = Nfa::from_expr(left_expr);
+            let right_nfa = Nfa::from_expr(right_expr);
+            return self.inner.analyze_binary_expr(
+                query,
+                left_expr,
+                right_expr,
+                &left_nfa,
+                &right_nfa,
+                &budget_config(config, started),
+            );
+        }
+
         let mut map = build_initial_map(left_expr, right_expr, self.max_abstractions);
 
         if map.is_empty() {
@@ -410,9 +496,23 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
             );
         }
 
+        // `build_initial_map` discovers common subexpressions from the
+        // *normalized* trees (alt branches sorted, concats flattened) --
+        // its map targets are normalized nodes. `apply_abstraction` (via
+        // `abstract_pair`) must walk that same normalized shape, or a node
+        // written in a different-but-equivalent order in the original
+        // source (`(b|a)` against a map entry discovered as `(a|b)`) fails
+        // the structural-key match and silently isn't replaced -- normalize
+        // is a pure language-preserving canonicalization (alternation is
+        // commutative and idempotent; concatenation is associative and `ε`
+        // is its identity), so working from `left_n`/`right_n` from here on
+        // changes nothing about what language gets analyzed.
+        let left_n = normalize(left_expr);
+        let right_n = normalize(right_expr);
+
         let mut rounds = 0;
         loop {
-            let (abs_left, abs_right) = abstract_pair(left_expr, right_expr, &map);
+            let (abs_left, abs_right) = abstract_pair(&left_n, &right_n, &map);
             let left_nfa = Nfa::from_expr(&abs_left);
             let right_nfa = Nfa::from_expr(&abs_right);
             let round_config = budget_config(config, started);
@@ -518,6 +618,172 @@ mod tests {
     use crate::config::Config;
     use crate::parser::parse;
     use crate::report::Verdict;
+
+    #[test]
+    fn ascii_alphabet_leaves_room_for_markers_unicode_does_not() {
+        assert!(alphabet_has_room_for_markers(Alphabet::Ascii));
+        assert!(!alphabet_has_room_for_markers(Alphabet::Unicode));
+    }
+
+    /// Direct regression test for the marker-collision mechanism in the bug
+    /// report, built by hand rather than via `build_initial_map`'s
+    /// auto-discovery. (`build_initial_map`/`apply_abstraction` only
+    /// replace *every* occurrence of a shared subexpression when they sit
+    /// at byte-identical spans across both patterns -- an orthogonal,
+    /// pre-existing quirk of `structural_key` unrelated to marker
+    /// freshness, and not always true for hand-written examples like the
+    /// one in the report. Building the map directly sidesteps that and
+    /// tests the actual mechanism at risk.)
+    ///
+    /// `shared` (`(x|y|z)`) is abstracted to `FRESH_BASE` (U+E000) in both
+    /// `left = shared · U+E000` and `right = shared · shared`. Because
+    /// U+E000 is *also* the marker value, `left`'s trailing literal already
+    /// equals the marker without any substitution -- so both abstracted
+    /// trees collapse to the identical two-marker string "σσ", and running
+    /// an inner backend on them directly reports Equivalent = YES, even
+    /// though the concrete languages (`x`/`y`/`z` followed by U+E000, vs.
+    /// `x`/`y`/`z` followed by `x`/`y`/`z`) are disjoint. This is exactly
+    /// the hazard `alphabet_has_room_for_markers` exists to shut out; the
+    /// second half of this test confirms the real `AbstractionBackend`
+    /// does shut it out under `Alphabet::Unicode`.
+    #[test]
+    fn hand_built_marker_collision_would_be_unsound_without_the_alphabet_gate() {
+        let shared = Expr::new(
+            ExprKind::Alt(vec![
+                Expr::new(ExprKind::Literal('x'), Span::new(0, 0)),
+                Expr::new(ExprKind::Literal('y'), Span::new(0, 0)),
+                Expr::new(ExprKind::Literal('z'), Span::new(0, 0)),
+            ]),
+            Span::new(0, 0),
+        );
+        let marker = char::from_u32(FRESH_BASE).unwrap();
+        let left_expr = Expr::new(
+            ExprKind::Concat(vec![
+                shared.clone(),
+                Expr::new(ExprKind::Literal(marker), Span::new(0, 0)),
+            ]),
+            Span::new(0, 0),
+        );
+        let right_expr = Expr::new(
+            ExprKind::Concat(vec![shared.clone(), shared.clone()]),
+            Span::new(0, 0),
+        );
+
+        // Hand-build the map the same way `build_initial_map` would if it
+        // had found this candidate.
+        let mut map = AbstractionMap::default();
+        map.entries
+            .insert(marker, (shared.clone(), expr_size(&shared)));
+        map.order.push(marker);
+        let (abs_left, abs_right) = abstract_pair(&left_expr, &right_expr, &map);
+
+        // Both abstracted trees collapse to the same two-marker string.
+        assert_eq!(structural_key(&abs_left), structural_key(&abs_right));
+
+        let cfg = Config {
+            alphabet: Alphabet::Unicode,
+            ..Config::default()
+        };
+
+        // Confirm the abstract analysis really would call this a sound YES...
+        let abs_left_nfa = Nfa::from_expr(&abs_left);
+        let abs_right_nfa = Nfa::from_expr(&abs_right);
+        let abstract_result = crate::analysis::AutomataBackend.analyze_binary(
+            Query::Equivalent,
+            &abs_left_nfa,
+            &abs_right_nfa,
+            &cfg,
+        );
+        assert_eq!(
+            abstract_verdict(Query::Equivalent, &abstract_result),
+            Some(true),
+            "sanity: the hand-built abstraction really does look like a sound YES"
+        );
+
+        // ...while the concrete languages are actually disjoint.
+        let left_nfa = Nfa::from_expr(&left_expr);
+        let right_nfa = Nfa::from_expr(&right_expr);
+        let concrete_result = crate::analysis::AutomataBackend.analyze_binary(
+            Query::Equivalent,
+            &left_nfa,
+            &right_nfa,
+            &cfg,
+        );
+        assert_eq!(
+            abstract_verdict(Query::Equivalent, &concrete_result),
+            Some(false),
+            "sanity: the concrete languages actually differ"
+        );
+
+        // The real driver must not walk into this trap under Alphabet::Unicode.
+        let backend = AbstractionBackend::new();
+        let real_result = backend.analyze_binary_expr(
+            Query::Equivalent,
+            &left_expr,
+            &right_expr,
+            &left_nfa,
+            &right_nfa,
+            &cfg,
+        );
+        assert_eq!(
+            abstract_verdict(Query::Equivalent, &real_result),
+            Some(false),
+            "AbstractionBackend must not trust the colliding abstraction under Alphabet::Unicode"
+        );
+    }
+
+    #[test]
+    fn structural_key_ignores_descendant_spans() {
+        // Same shape, different source positions (as `(x|y|z)` occurring
+        // twice in one pattern would produce): keys must match regardless.
+        let a = Expr::new(
+            ExprKind::Alt(vec![
+                Expr::new(ExprKind::Literal('x'), Span::new(0, 1)),
+                Expr::new(ExprKind::Literal('y'), Span::new(2, 3)),
+            ]),
+            Span::new(0, 4),
+        );
+        let b = Expr::new(
+            ExprKind::Alt(vec![
+                Expr::new(ExprKind::Literal('x'), Span::new(100, 101)),
+                Expr::new(ExprKind::Literal('y'), Span::new(200, 201)),
+            ]),
+            Span::new(50, 250),
+        );
+        assert_eq!(structural_key(&a), structural_key(&b));
+    }
+
+    /// Regression test: `build_initial_map` discovers common subexpressions
+    /// from *normalized* trees (alt branches sorted), but used to hand
+    /// `apply_abstraction` the original, un-normalized trees to match
+    /// against. `(b|a)`, written in source order, never matched a map
+    /// entry discovered (and stored) as the normalized `(a|b)` -- so a
+    /// subexpression written in a different-but-equivalent branch order on
+    /// one side either silently skipped abstraction (safe, just slower) or,
+    /// combined with the `structural_key` span leak, could abstract only
+    /// one side. `analyze_binary_expr` now matches against `left_n`/`right_n`
+    /// (both normalized), so this must fully collapse instead of falling
+    /// through to the automata-sized product this pair would otherwise need.
+    #[test]
+    fn abstracts_a_subexpression_written_in_different_branch_order() {
+        let cfg = Config::default();
+        let backend = AbstractionBackend::new();
+        let left = "((a|b|c|d|e){25}f){10}x";
+        let right = "((e|d|c|b|a){25}f){10}x"; // same alternation, reversed order
+        let report =
+            analyze_binary_with_backend(Query::Equivalent, left, right, &cfg, &backend).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        // A full concrete product for this pair visits >1000 states (see
+        // the sibling automata-backend comparison in this test file's
+        // history); successful abstraction collapses both repeated blocks
+        // to a single shared marker, leaving a tiny product.
+        assert!(
+            report.statistics.visited_product_states < 10,
+            "expected the shared, differently-ordered alternation to collapse via \
+             abstraction, got {} product states",
+            report.statistics.visited_product_states
+        );
+    }
 
     #[test]
     fn discovers_common_star() {
