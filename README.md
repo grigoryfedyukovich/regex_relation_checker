@@ -45,6 +45,9 @@ regexrel --json equivalent '^a+$' 'aa*'
 regexrel --stats --backend minimized --max-states 50000 overlap 'a.*z' 'ab+z'
 regexrel --backend derivatives equivalent 'a*a*a*' 'a*'
 regexrel --backend abstraction --stats equivalent '((a|b){25}c){10}x' '((a|b){25}c){10}x'
+regexrel --draw nfa 'a+b'
+regexrel --draw dfa --output dfa.pdf '(a|b)*a'
+regexrel --draw minimized --emit-dot '[ab]+'
 ```
 
 ## Analysis engines
@@ -121,6 +124,30 @@ done
 ```
 
 Full write-up: **[docs/backends.md](docs/backends.md)**.
+
+## Drawing automata
+
+`--draw` renders a **single** regex as a Graphviz automaton and dumps a PDF
+(produced by `dot`). This is not a relation query: only one pattern is
+accepted.
+
+| Kind | Automaton | Implementation |
+|------|-----------|----------------|
+| `nfa` | Thompson ε-NFA | `Nfa::from_expr` |
+| `dfa` | Subset-construction DFA | `minimize::determinize` |
+| `minimized` | Moore-minimized DFA | `minimize::minimize` |
+
+```bash
+regexrel --draw nfa 'a+b'                      # writes nfa.pdf
+regexrel --draw dfa --output dfa.pdf '(a|b)*a'
+regexrel --draw minimized --emit-dot '[ab]+'   # DOT on stdout
+regexrel --draw nfa --output graph.dot 'colou?r'
+```
+
+`--output` defaults to `<kind>.pdf`. A `.dot` suffix, or `--emit-dot`, skips
+Graphviz so the command works without `dot` installed. `.svg` / `.png` are
+handed to `dot` as `-Tsvg` / `-Tpng`. `--alphabet`, `--dot-matches-newline`,
+`--max-states`, and `--timeout-ms` apply as they do for analysis.
 
 ## Benchmark files
 

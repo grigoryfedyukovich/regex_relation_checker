@@ -394,3 +394,102 @@ fn syntax_error_is_distinct() {
                 .and(predicate::str::contains("unterminated group")),
         );
 }
+
+#[test]
+fn draw_nfa_emits_dot_for_a_single_regex() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["--draw", "nfa", "--emit-dot", "a+b"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("digraph")
+                .and(predicate::str::contains("label=\"a\""))
+                .and(predicate::str::contains("label=\"b\""))
+                .and(predicate::str::contains("label=\"ε\"")),
+        );
+}
+
+#[test]
+fn draw_subcommand_matches_the_flag() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["draw", "dfa", "--emit-dot", "a|b"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("digraph")
+                .and(predicate::str::contains("label=\"a\""))
+                .and(predicate::str::contains("Minimized DFA").not())
+                .and(predicate::str::contains("DFA of a|b")),
+        );
+}
+
+#[test]
+fn draw_minimized_emits_dot() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["--draw=minimized", "--emit-dot", "[ab]"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("digraph")
+                .and(predicate::str::contains("Minimized DFA of [ab]")),
+        );
+}
+
+#[test]
+fn draw_writes_a_dot_file_without_graphviz() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("regexrel-draw-{nonce}.dot"));
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["--draw", "nfa", "--output", path.to_str().unwrap(), "ab"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("wrote")
+                .and(predicate::str::contains("states"))
+                .and(predicate::str::contains("transitions")),
+        );
+    let contents = fs::read_to_string(&path).unwrap();
+    fs::remove_file(&path).ok();
+    assert!(contents.contains("digraph"));
+    assert!(contents.contains("label=\"a\""));
+    assert!(contents.contains("label=\"b\""));
+}
+
+#[test]
+fn draw_rejects_an_unknown_kind() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["--draw", "pda", "a"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("invalid value 'pda'")
+                .or(predicate::str::contains("invalid value")),
+        );
+}
+
+#[test]
+fn draw_requires_a_regex() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["--draw", "nfa"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn draw_reports_syntax_errors() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args(["--draw", "nfa", "--emit-dot", "("])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("input error [syntax]"));
+}

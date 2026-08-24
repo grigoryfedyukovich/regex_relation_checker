@@ -52,18 +52,20 @@ use std::time::{Duration, Instant};
 /// transition function total (every state has *some* target for every
 /// character), which removes the need for `Option`-handling everywhere a
 /// transition is looked up.
-const DEAD: usize = 0;
+pub(crate) const DEAD: usize = 0;
 
 #[derive(Clone, Debug)]
-struct DfaState {
-    accepting: bool,
-    transitions: Vec<(CharSet, usize)>,
+pub(crate) struct DfaState {
+    pub(crate) accepting: bool,
+    pub(crate) transitions: Vec<(CharSet, usize)>,
+    /// NFA state-ids in this DFA state's subset (preserved through minimize).
+    pub(crate) members: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
-struct Dfa {
-    states: Vec<DfaState>,
-    start: usize,
+pub(crate) struct Dfa {
+    pub(crate) states: Vec<DfaState>,
+    pub(crate) start: usize,
 }
 
 /// Look up where `state_id` goes on `ch`, defaulting to [`DEAD`] when no
@@ -151,7 +153,7 @@ fn alphabet_partition(sets: &[&CharSet]) -> Vec<(u32, u32, char)> {
 /// elsewhere in this crate, this used to have no time-based bound at all --
 /// only `max_states` -- so `--timeout-ms` had no effect until determinization
 /// finished or hit the state cap, however long that took.
-fn determinize(
+pub(crate) fn determinize(
     nfa: &Nfa,
     max_states: usize,
     started: Instant,
@@ -160,6 +162,7 @@ fn determinize(
     let mut states: Vec<DfaState> = vec![DfaState {
         accepting: false,
         transitions: Vec::new(),
+        members: Vec::new(),
     }];
     let mut subsets: Vec<Vec<usize>> = vec![Vec::new()];
     let mut subset_index: HashMap<Vec<usize>, usize> = HashMap::new();
@@ -174,6 +177,7 @@ fn determinize(
         states.push(DfaState {
             accepting: nfa.is_accepting(&start_subset),
             transitions: Vec::new(),
+            members: start_subset.clone(),
         });
         subsets.push(start_subset);
         id
@@ -213,6 +217,7 @@ fn determinize(
                 states.push(DfaState {
                     accepting: nfa.is_accepting(&next_subset),
                     transitions: Vec::new(),
+                    members: next_subset.clone(),
                 });
                 subsets.push(next_subset);
                 queue.push_back(idx);
@@ -240,7 +245,11 @@ fn determinize(
 /// to run to completion unconditionally, ignoring `--timeout-ms` entirely,
 /// even though a full refinement pass touches every state on every
 /// iteration and iteration count itself scales with the DFA's size.
-fn minimize(dfa: &Dfa, started: Instant, deadline: Duration) -> Result<Dfa, BackendStatus> {
+pub(crate) fn minimize(
+    dfa: &Dfa,
+    started: Instant,
+    deadline: Duration,
+) -> Result<Dfa, BackendStatus> {
     let all_sets: Vec<&CharSet> = dfa
         .states
         .iter()
@@ -294,7 +303,15 @@ fn minimize(dfa: &Dfa, started: Instant, deadline: Duration) -> Result<Dfa, Back
     }
 
     let mut new_states = Vec::with_capacity(num_classes);
-    for rep in &representative_of_class {
+    let mut class_members: Vec<Vec<usize>> = vec![Vec::new(); num_classes];
+    for (state_id, &class) in partition.iter().enumerate() {
+        class_members[class].extend(dfa.states[state_id].members.iter().copied());
+    }
+    for members in &mut class_members {
+        members.sort_unstable();
+        members.dedup();
+    }
+    for (class, rep) in representative_of_class.iter().enumerate() {
         let rep_state = rep.expect("every class has at least one member");
         let accepting = dfa.states[rep_state].accepting;
         let transitions = dfa.states[rep_state]
@@ -305,6 +322,7 @@ fn minimize(dfa: &Dfa, started: Instant, deadline: Duration) -> Result<Dfa, Back
         new_states.push(DfaState {
             accepting,
             transitions,
+            members: class_members[class].clone(),
         });
     }
 

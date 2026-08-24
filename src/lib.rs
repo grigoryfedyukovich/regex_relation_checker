@@ -12,6 +12,7 @@ pub mod ast;
 pub mod charset;
 pub mod config;
 pub mod derivative;
+pub mod draw;
 pub mod minimize;
 pub mod nfa;
 pub mod parser;
@@ -26,6 +27,7 @@ pub use analysis::{
 pub use antimirov::AntimirovBackend;
 pub use config::{Alphabet, Config};
 pub use derivative::DerivativeBackend;
+pub use draw::{draw_dot, render_graph, DrawError, DrawKind, DrawResult};
 pub use minimize::MinimizedBackend;
 pub use parser::{parse, FrontendError, FrontendErrorKind};
 pub use report::{BackendInfo, Report, Verdict, Witness};

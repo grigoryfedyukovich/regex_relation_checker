@@ -29,6 +29,7 @@ Report (text or JSON) + optional shortest witness
 | `nfa` | Thompson ε-NFA construction and helpers |
 | `analysis` | `RelationBackend` trait, default **automata** product BFS, orchestration |
 | `minimize` | **minimized** backend: determinize, Moore minimize, isomorphism / DFA product |
+| `draw` | Graphviz DOT/PDF rendering of NFA, DFA, or minimized DFA (`--draw`) |
 | `derivative` | **derivatives** backend: residual algebra + residual-pair product |
 | `antimirov` | **antimirov** backend: partial derivatives (linear forms) + product |
 | `abstraction` | **abstraction** backend: common-subexpression CEGAR reduction, delegates to **automata** |

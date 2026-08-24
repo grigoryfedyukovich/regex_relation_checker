@@ -135,10 +135,18 @@ regexrel [OPTIONS] <COMMAND>
 regexrel [OPTIONS] <BENCHMARK_FILE>
 ```
 
-Commands: `empty`, `match`, `overlap`, `includes`, `equivalent`, `syntax`.
+Commands: `empty`, `match`, `overlap`, `includes`, `equivalent`, `syntax`,
+`draw`.
+
+`--draw <nfa|dfa|minimized>` (equivalent to the `draw` subcommand) renders
+exactly one regex as a Graphviz automaton and dumps a PDF via `dot`. `nfa`
+uses the Thompson construction, `dfa` the existing subset construction, and
+`minimized` Moore minimization. `--output PATH` selects the file (default
+`<kind>.pdf`); `--emit-dot` prints Graphviz source instead of invoking `dot`.
 
 Global options include `--backend`, `--json`, `--stats`, `--print-config`,
-`--fail-on`, and the configuration flags above.
+`--fail-on`, `--draw`, `--output`, `--emit-dot`, and the configuration flags
+above.
 
 ### Benchmark files
 

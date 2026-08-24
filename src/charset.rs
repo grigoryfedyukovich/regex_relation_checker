@@ -187,6 +187,121 @@ impl CharSet {
     pub fn is_empty(&self) -> bool {
         self.intervals.is_empty()
     }
+
+    /// A charset that contains exactly one scalar value.
+    pub fn as_singleton(&self) -> Option<char> {
+        match *self.intervals.as_slice() {
+            [interval] if interval.start == interval.end => char::from_u32(interval.start),
+            _ => None,
+        }
+    }
+
+    /// Compact Graphviz edge label for this set under `alphabet`.
+    ///
+    /// Prefers `.`, shorthands (`\d`, `\w`, `\s` and their complements), a
+    /// singleton character, or a character class — using a negated class when
+    /// that spelling is shorter.
+    pub fn to_dot_label(&self, alphabet: Alphabet, dot_matches_newline: bool) -> String {
+        if self.is_empty() {
+            return "∅".to_owned();
+        }
+        let any = Self::any(alphabet, dot_matches_newline);
+        if self == &any {
+            return ".".to_owned();
+        }
+        if self == &Self::ascii_digits() {
+            return "\\d".to_owned();
+        }
+        if self == &Self::ascii_word() {
+            return "\\w".to_owned();
+        }
+        if self == &Self::ascii_space() {
+            return "\\s".to_owned();
+        }
+        let digits_c = Self::ascii_digits().complement(alphabet);
+        let word_c = Self::ascii_word().complement(alphabet);
+        let space_c = Self::ascii_space().complement(alphabet);
+        if self == &digits_c {
+            return "\\D".to_owned();
+        }
+        if self == &word_c {
+            return "\\W".to_owned();
+        }
+        if self == &space_c {
+            return "\\S".to_owned();
+        }
+        if let Some(ch) = self.as_singleton() {
+            return format_dot_char(ch);
+        }
+        let positive = format!("[{}]", format_class_body(self));
+        let complement = any.subtract(self);
+        if !complement.is_empty() {
+            if let Some(ch) = complement.as_singleton() {
+                let negated = format!("[^{}]", format_class_char(ch));
+                if negated.len() <= positive.len() {
+                    return negated;
+                }
+            }
+            let negated = format!("[^{}]", format_class_body(&complement));
+            if negated.len() < positive.len() {
+                return negated;
+            }
+        }
+        positive
+    }
+}
+
+fn format_dot_char(ch: char) -> String {
+    match ch {
+        '\n' => "\\n".to_owned(),
+        '\r' => "\\r".to_owned(),
+        '\t' => "\\t".to_owned(),
+        '\0' => "\\0".to_owned(),
+        ' ' => "SP".to_owned(),
+        c if c.is_control() => format!("U+{:04X}", c as u32),
+        c => c.to_string(),
+    }
+}
+
+fn format_class_char(ch: char) -> String {
+    match ch {
+        '\n' => "\\n".to_owned(),
+        '\r' => "\\r".to_owned(),
+        '\t' => "\\t".to_owned(),
+        '\0' => "\\0".to_owned(),
+        '\\' => "\\\\".to_owned(),
+        ']' => "\\]".to_owned(),
+        '^' => "\\^".to_owned(),
+        '-' => "\\-".to_owned(),
+        ' ' => "SP".to_owned(),
+        c if c.is_control() => format!("U+{:04X}", c as u32),
+        c => c.to_string(),
+    }
+}
+
+fn format_class_body(set: &CharSet) -> String {
+    let mut out = String::new();
+    for interval in set.intervals() {
+        let start = match char::from_u32(interval.start) {
+            Some(ch) => ch,
+            None => continue,
+        };
+        let end = match char::from_u32(interval.end) {
+            Some(ch) => ch,
+            None => continue,
+        };
+        if interval.start == interval.end {
+            out.push_str(&format_class_char(start));
+        } else if interval.end == interval.start + 1 {
+            out.push_str(&format_class_char(start));
+            out.push_str(&format_class_char(end));
+        } else {
+            out.push_str(&format_class_char(start));
+            out.push('-');
+            out.push_str(&format_class_char(end));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -283,6 +398,43 @@ mod tests {
         assert!(CharSet::ascii_space().contains('\t'));
         assert!(CharSet::ascii_space().contains(' '));
         assert!(!CharSet::ascii_space().contains('a'));
+    }
+
+    #[test]
+    fn dot_labels_prefer_compact_spellings() {
+        assert_eq!(
+            CharSet::singleton('a').to_dot_label(Alphabet::Ascii, false),
+            "a"
+        );
+        assert_eq!(
+            CharSet::from_interval('a', 'z').to_dot_label(Alphabet::Ascii, false),
+            "[a-z]"
+        );
+        assert_eq!(
+            CharSet::any(Alphabet::Ascii, false).to_dot_label(Alphabet::Ascii, false),
+            "."
+        );
+        assert_eq!(
+            CharSet::ascii_digits().to_dot_label(Alphabet::Ascii, false),
+            "\\d"
+        );
+        assert_eq!(
+            CharSet::singleton('a')
+                .complement(Alphabet::Ascii)
+                .to_dot_label(Alphabet::Ascii, false),
+            "[^a]"
+        );
+        assert_eq!(
+            CharSet::singleton('\n').to_dot_label(Alphabet::Ascii, false),
+            "\\n"
+        );
+    }
+
+    #[test]
+    fn as_singleton_rejects_ranges() {
+        assert_eq!(CharSet::singleton('x').as_singleton(), Some('x'));
+        assert_eq!(CharSet::from_interval('a', 'c').as_singleton(), None);
+        assert_eq!(CharSet::empty().as_singleton(), None);
     }
 
     #[test]

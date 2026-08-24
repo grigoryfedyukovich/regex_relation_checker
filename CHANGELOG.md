@@ -4,6 +4,12 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Added `--draw <nfa|dfa|minimized>` (and the equivalent `draw` subcommand) to
+  dump a Graphviz PDF of a single regex. `nfa` uses the Thompson ε-NFA,
+  `dfa` the existing subset construction in `minimize::determinize`, and
+  `minimized` Moore minimization in `minimize::minimize`. `--output` selects
+  the file (default `<kind>.pdf`); `--emit-dot` or a `.dot` suffix writes
+  Graphviz source without invoking `dot`.
 - Fixed: `minimize.rs`'s `alphabet_partition` added a boundary after an
   interval's end only when `end < 0x10ffff`, so under `--alphabet unicode`
   an interval ending exactly at `U+10FFFF` got no trailing boundary. Because

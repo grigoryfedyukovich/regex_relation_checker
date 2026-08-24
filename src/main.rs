@@ -6,9 +6,9 @@ use regexrel::config::{Alphabet, Config};
 use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
-    analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
-    AbstractionBackend, AntimirovBackend, AutomataBackend, DerivativeBackend, MinimizedBackend,
-    Query, RelationBackend,
+    analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend, draw_dot,
+    render_graph, AbstractionBackend, AntimirovBackend, AutomataBackend, DerivativeBackend,
+    DrawError, DrawKind, MinimizedBackend, Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,8 +33,12 @@ after any preceding flags. Examples:\n\n\
 where the file contains e.g.\n\n\
     # overlap: a+b vs ab+\n\
     overlap 'a+b' 'ab+'\n\n\
-Subcommand names (empty, match, overlap, includes, equivalent, syntax) are never \
-interpreted as benchmark paths."
+Subcommand names (empty, match, overlap, includes, equivalent, syntax, draw) are never \
+interpreted as benchmark paths.\n\n\
+Draw an automaton as a Graphviz PDF (requires `dot` on PATH):\n\n\
+    regexrel --draw nfa 'a+b'\n\
+    regexrel --draw dfa --output dfa.pdf '(a|b)*a'\n\
+    regexrel --draw minimized --emit-dot '[ab]+'"
 )]
 struct Cli {
     /// TOML configuration file. If omitted, ./regexrel.toml is loaded when present.
@@ -98,6 +102,21 @@ struct Cli {
     )]
     abstraction_inner: AbstractionInnerArg,
 
+    /// Draw an automaton as a Graphviz PDF. Takes `nfa`, `dfa`, or `minimized`.
+    /// Expects exactly one regex (not a relation query). Equivalent to the
+    /// `draw` subcommand: `regexrel --draw nfa 'a+b'`.
+    #[arg(long, value_enum, value_name = "KIND", global = true)]
+    draw: Option<DrawKindArg>,
+
+    /// Output path for `--draw` (default: `<kind>.pdf`). A `.dot` suffix
+    /// writes Graphviz source without invoking `dot`.
+    #[arg(short, long, global = true)]
+    output: Option<PathBuf>,
+
+    /// Print Graphviz DOT to stdout instead of rendering a PDF.
+    #[arg(long, global = true)]
+    emit_dot: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -151,6 +170,23 @@ enum AlphabetArg {
     Unicode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DrawKindArg {
+    Nfa,
+    Dfa,
+    Minimized,
+}
+
+impl From<DrawKindArg> for DrawKind {
+    fn from(value: DrawKindArg) -> Self {
+        match value {
+            DrawKindArg::Nfa => DrawKind::Nfa,
+            DrawKindArg::Dfa => DrawKind::Dfa,
+            DrawKindArg::Minimized => DrawKind::Minimized,
+        }
+    }
+}
+
 impl From<AlphabetArg> for Alphabet {
     fn from(value: AlphabetArg) -> Self {
         match value {
@@ -183,6 +219,13 @@ enum Command {
     Equivalent { left: String, right: String },
     /// Print the supported regex subset and semantic notes.
     Syntax,
+    /// Draw an NFA, DFA, or minimized DFA as a Graphviz PDF.
+    Draw {
+        /// Which automaton to render: nfa, dfa, or minimized.
+        kind: DrawKindArg,
+        /// The regular expression to draw.
+        regex: String,
+    },
 }
 
 /// Subcommand names that must always be parsed as subcommands, never as a
@@ -191,13 +234,14 @@ enum Command {
 /// this keeps `regexrel equivalent` (missing its required arguments) failing
 /// with clap's normal "missing required argument" message instead of
 /// silently taking a different code path.
-const RESERVED_SUBCOMMAND_NAMES: [&str; 6] = [
+const RESERVED_SUBCOMMAND_NAMES: [&str; 7] = [
     "empty",
     "match",
     "overlap",
     "includes",
     "equivalent",
     "syntax",
+    "draw",
 ];
 
 /// If the last argument names an existing, readable file (and is not a
@@ -241,6 +285,39 @@ fn expand_benchmark_file(args: &[String]) -> Result<Option<Vec<String>>, String>
     expanded.extend_from_slice(&args[..args.len() - 1]);
     expanded.extend(tokens);
     Ok(Some(expanded))
+}
+
+/// Rewrite `--draw KIND` / `--draw=KIND` into the `draw` subcommand so
+/// `regexrel --draw nfa 'a+b'` is accepted as a flag, matching the requested
+/// CLI option, while still sharing one implementation with `regexrel draw`.
+fn rewrite_draw_option(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 1);
+    let mut i = 0;
+    let mut rewritten = false;
+    while i < args.len() {
+        let arg = &args[i];
+        if !rewritten {
+            if let Some(kind) = arg.strip_prefix("--draw=") {
+                out.push("draw".to_owned());
+                if !kind.is_empty() {
+                    out.push(kind.to_owned());
+                }
+                rewritten = true;
+                i += 1;
+                continue;
+            }
+            if arg == "--draw" && i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                out.push("draw".to_owned());
+                out.push(args[i + 1].clone());
+                rewritten = true;
+                i += 2;
+                continue;
+            }
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
 }
 
 fn strip_comment_lines(input: &str) -> String {
@@ -312,9 +389,10 @@ fn tokenize_args(input: &str) -> Result<Vec<String>, String> {
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args = rewrite_draw_option(&raw_args);
     let cli = match expand_benchmark_file(&raw_args) {
         Ok(Some(expanded)) => Cli::parse_from(expanded),
-        Ok(None) => Cli::parse(),
+        Ok(None) => Cli::parse_from(&raw_args),
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::from(INPUT_ERROR_EXIT);
@@ -346,9 +424,15 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         println!("{rendered}");
     }
 
-    let Some(command) = cli.command else {
+    let Some(ref command) = cli.command else {
         if cli.print_config {
             return Ok(0);
+        }
+        if cli.draw.is_some() {
+            return Err((
+                INPUT_ERROR_EXIT,
+                "a regex is required with --draw; example: regexrel --draw nfa 'a+b'".to_owned(),
+            ));
         }
         return Err((
             INPUT_ERROR_EXIT,
@@ -359,6 +443,10 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
     if matches!(&command, Command::Syntax) {
         print!("{SYNTAX_HELP}");
         return Ok(0);
+    }
+
+    if let Command::Draw { kind, regex } = command {
+        return run_draw(*kind, regex, &cli, &config);
     }
 
     // Own the abstraction wrappers so their addresses stay valid for the
@@ -380,20 +468,20 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
     };
 
     let mut report = match command {
-        Command::Empty { regex } => analyze_empty_with_backend(&regex, &config, backend),
+        Command::Empty { regex } => analyze_empty_with_backend(regex, &config, backend),
         Command::Match { regex, input } => {
-            analyze_match_with_backend(&regex, &input, &config, backend)
+            analyze_match_with_backend(regex, input, &config, backend)
         }
         Command::Overlap { left, right } => {
-            analyze_binary_with_backend(Query::Overlap, &left, &right, &config, backend)
+            analyze_binary_with_backend(Query::Overlap, left, right, &config, backend)
         }
         Command::Includes { left, right } => {
-            analyze_binary_with_backend(Query::Includes, &left, &right, &config, backend)
+            analyze_binary_with_backend(Query::Includes, left, right, &config, backend)
         }
         Command::Equivalent { left, right } => {
-            analyze_binary_with_backend(Query::Equivalent, &left, &right, &config, backend)
+            analyze_binary_with_backend(Query::Equivalent, left, right, &config, backend)
         }
-        Command::Syntax => unreachable!(),
+        Command::Syntax | Command::Draw { .. } => unreachable!(),
     }
     .map_err(render_analysis_error)?;
 
@@ -438,6 +526,48 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         Ok(config.ci_exit_code as u8)
     } else {
         Ok(0)
+    }
+}
+
+fn run_draw(
+    kind: DrawKindArg,
+    regex: &str,
+    cli: &Cli,
+    config: &Config,
+) -> Result<u8, (u8, String)> {
+    let kind = DrawKind::from(kind);
+    let result = draw_dot(regex, kind, config).map_err(render_draw_error)?;
+    if cli.emit_dot {
+        print!("{}", result.dot);
+        return Ok(0);
+    }
+    let output = cli
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("{}.pdf", kind.as_str())));
+    render_graph(&result.dot, &output).map_err(render_draw_error)?;
+    println!(
+        "wrote {} ({} states, {} transitions)",
+        output.display(),
+        result.state_count,
+        result.transition_count
+    );
+    Ok(0)
+}
+
+fn render_draw_error(error: DrawError) -> (u8, String) {
+    match error {
+        DrawError::Input(error) => render_analysis_error(AnalyzeError::Input(error)),
+        DrawError::Limit(message) => (INPUT_ERROR_EXIT, message),
+        DrawError::Io { path, source } => (
+            INPUT_ERROR_EXIT,
+            format!("could not write '{path}': {source}"),
+        ),
+        DrawError::DotMissing => (INPUT_ERROR_EXIT, error.to_string()),
+        DrawError::DotFailed { code, stderr } => (
+            INPUT_ERROR_EXIT,
+            format!("graphviz `dot` failed{code}: {stderr}"),
+        ),
     }
 }
 
@@ -627,5 +757,52 @@ mod tests {
         let mut json = "{}".to_owned();
         let error = patch_json_number(&mut json, "total_ms", 0, 1).unwrap_err();
         assert_eq!(error.0, INTERNAL_ERROR_EXIT);
+    }
+
+    #[test]
+    fn rewrite_draw_flag_to_subcommand() {
+        let args = vec![
+            "regexrel".to_owned(),
+            "--draw".to_owned(),
+            "nfa".to_owned(),
+            "a+b".to_owned(),
+        ];
+        assert_eq!(
+            rewrite_draw_option(&args),
+            vec!["regexrel", "draw", "nfa", "a+b"]
+        );
+    }
+
+    #[test]
+    fn rewrite_draw_equals_form() {
+        let args = vec![
+            "regexrel".to_owned(),
+            "--alphabet".to_owned(),
+            "unicode".to_owned(),
+            "--draw=minimized".to_owned(),
+            "é+".to_owned(),
+        ];
+        assert_eq!(
+            rewrite_draw_option(&args),
+            vec![
+                "regexrel",
+                "--alphabet",
+                "unicode",
+                "draw",
+                "minimized",
+                "é+"
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrite_draw_ignores_unrelated_draw_tokens() {
+        let args = vec![
+            "regexrel".to_owned(),
+            "overlap".to_owned(),
+            "a".to_owned(),
+            "b".to_owned(),
+        ];
+        assert_eq!(rewrite_draw_option(&args), args);
     }
 }
