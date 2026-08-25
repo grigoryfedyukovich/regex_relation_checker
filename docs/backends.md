@@ -198,6 +198,13 @@ alternation where residual *sets* stay narrow; research comparisons on the
 
 **Pipeline**
 
+0. Before anything else, check whether the configured `--alphabet` leaves
+   any scalar value free for a marker (`alphabet_has_room_for_markers`).
+   `--alphabet ascii` does (the Private Use Area sits above it); `--alphabet
+   unicode` does not — its declared scalar range is every valid Unicode
+   scalar value there is, so no `char` is left over for a marker to safely
+   claim. If there's no room, skip straight to step 3's inner backend on
+   the original, unabstracted patterns; steps 1–2 never run.
 1. Walk both ASTs and collect every subexpression, keyed by a *structural*
    signature (kind + children, independent of source span). A candidate is
    worth abstracting once it's large enough (`MIN_ABSTRACT_SIZE`) and its
@@ -205,7 +212,7 @@ alternation where residual *sets* stay narrow; research comparisons on the
 2. Rank candidates largest-first (ties broken by structural key, so the
    choice is deterministic across runs), keep up to `max_abstractions` of
    them, and assign each a fresh marker character from the Unicode Private
-   Use Area, disjoint from the ordinary alphabet.
+   Use Area.
 3. Rewrite both ASTs, replacing every occurrence of each chosen
    subexpression — wherever it appears, in either pattern — with its
    marker. Run the configured *inner* backend (default `automata`; set
@@ -238,7 +245,10 @@ patterns) is a language substitution `h` with `h(σ) = L(S)`. This gives
 `L(A) = h(L(A'))` unconditionally, and `h` is monotonic under subset — so an
 abstract `YES` on Includes/Equivalent always implies the concrete `YES`. An
 abstract `YES` on Overlap needs one more step (the witness must be
-expandable into a real string), which is exactly what step 4 checks.
+expandable into a real string), which is exactly what step 4 checks. Both
+steps depend on `σ ∉ Σ` (step 0) — a marker that's actually a member of the
+configured alphabet is just an ordinary character, and a real occurrence of
+it anywhere in either pattern breaks the substitution `h` is supposed to be.
 
 **Strengths**
 
@@ -266,6 +276,12 @@ expandable into a real string), which is exactly what step 4 checks.
   right-hand side, for example) have nothing for this technique to grab
   onto, and `abstraction` degenerates to plain `automata` with no
   meaningful overhead.
+- No benefit at all under `--alphabet unicode` (step 0): every call
+  degenerates to plain `automata` (or whichever `--abstraction-inner`),
+  including on patterns that share large blocks verbatim and would have
+  gotten the full CEGAR speedup under `--alphabet ascii`. This is a real
+  performance cost, not a rare corner case, for any Unicode-alphabet
+  workload — the trade-off is deliberate (see `docs/limitations.md`).
 - Unlike the other four engines, it is not currently exercised by
   `tests/backend_agreement.rs`'s differential fuzzing (see the note in the
   overview above).

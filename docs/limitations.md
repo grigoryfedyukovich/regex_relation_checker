@@ -16,7 +16,16 @@ four are (see `docs/backends.md`). It only helps prove `YES` when the two
 patterns share a large subexpression verbatim; on a real `NO`, or on
 patterns with no shared structure (the nth-from-end family above, for
 instance), it falls back to `automata` with a small, bounded constant
-overhead and no algorithmic benefit.
+overhead and no algorithmic benefit. It also falls back unconditionally
+under `--alphabet unicode`: its marker-substitution technique needs a
+scalar value outside the configured alphabet to stand in for an abstracted
+subexpression, and `--alphabet unicode`'s declared range is every valid
+Unicode scalar value there is, leaving none free. Abstracting anyway would
+let a marker collide with a real occurrence of that character in either
+pattern, breaking the soundness argument the technique depends on (see
+`docs/backends.md`, `abstraction`, step 0) — so under this alphabet
+`abstraction` gets no benefit at all, not even on patterns that share a
+large block verbatim.
 
 
 ## Correctness work
