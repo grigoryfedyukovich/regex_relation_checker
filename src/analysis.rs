@@ -176,20 +176,34 @@ fn nfa_match_input(nfa: &Nfa, input: &str, config: &Config) -> BackendResult {
                 witness_extraction_ms: 0,
             };
         }
-        if seen.len() >= config.max_product_states {
-            return BackendResult {
-                status: BackendStatus::StateLimit,
-                witness: None,
-                relation: None,
-                visited_states: seen.len(),
-                generated_transitions: generated,
-                analysis_ms: started.elapsed().as_millis(),
-                witness_extraction_ms: 0,
-            };
-        }
         generated += 1;
-        subset = nfa.step(&subset, ch);
-        seen.insert(subset.clone());
+        // Always compute the transition for this character first -- only
+        // *then* decide whether the resulting subset can be afforded.
+        // Revisiting an already-seen subset (e.g. a self-loop) never costs
+        // anything and must always be allowed to proceed, even exactly at
+        // the cap; checking `seen.len() >= max_product_states` before
+        // stepping (the previous behavior) rejected every non-empty input
+        // whenever the cap was already reached by the *start* subset alone
+        // -- e.g. `--max-states 1` made every non-empty match UNKNOWN,
+        // regardless of whether the pattern ever actually needed a second
+        // state. Same "intern" shape as `ResidualInterner::intern` /
+        // `LinearFormInterner::intern` in derivative.rs/antimirov.rs.
+        let next = nfa.step(&subset, ch);
+        if !seen.contains(&next) {
+            if seen.len() >= config.max_product_states {
+                return BackendResult {
+                    status: BackendStatus::StateLimit,
+                    witness: None,
+                    relation: None,
+                    visited_states: seen.len(),
+                    generated_transitions: generated,
+                    analysis_ms: started.elapsed().as_millis(),
+                    witness_extraction_ms: 0,
+                };
+            }
+            seen.insert(next.clone());
+        }
+        subset = next;
     }
     let analysis_ms = started.elapsed().as_millis();
     if nfa.is_accepting(&subset) {
@@ -1580,6 +1594,69 @@ mod tests {
 
         let report = analyze_match("a+", "", &Config::default()).unwrap();
         assert_eq!(report.verdict, Verdict::No);
+    }
+
+    /// Regression test: `nfa_match_input` checked `seen.len() >=
+    /// max_product_states` *before* stepping on the current character, using
+    /// the state count left over from the *previous* character (or, on the
+    /// very first character, just the start subset) -- so it rejected a
+    /// character it had never even tried stepping on, regardless of whether
+    /// that step would land on a brand new subset or revisit one already
+    /// seen (e.g. a self-loop). At `--max-states 1`, the start subset alone
+    /// already meets the cap, so *every* non-empty input was rejected before
+    /// the first character was ever read -- observable as
+    /// `generated_transitions == 0` even though a character was available to
+    /// process. `"ab"` still correctly hits the limit either way (a second,
+    /// never-revisited subset really is needed here), but that must happen
+    /// only *after* attempting to step on `'a'`, not before.
+    #[test]
+    fn state_limit_does_not_reject_a_character_before_stepping_on_it() {
+        let config = Config {
+            max_product_states: 1,
+            ..Config::default()
+        };
+        let report = analyze_match_with_backend("ab", "ab", &config, &AutomataBackend).unwrap();
+        assert_eq!(report.verdict, Verdict::Unknown);
+        assert!(
+            report.statistics.generated_transitions >= 1,
+            "expected the first character to have been attempted before hitting the \
+             state limit, got generated_transitions = {}",
+            report.statistics.generated_transitions
+        );
+    }
+
+    /// Regression test, self-loop case: a subset that recurs (as `a*`'s
+    /// does, once past the first repetition) must never count against the
+    /// cap on revisits -- only a genuinely *new* subset should. Before the
+    /// fix, every character's stale pre-step check made the walk fail after
+    /// its first new subset, however long the run of self-loop characters
+    /// that followed would have been.
+    #[test]
+    fn state_limit_allows_an_unbounded_self_loop_once_seen() {
+        let config = Config {
+            max_product_states: 2,
+            ..Config::default()
+        };
+        let long_run = "a".repeat(200);
+        let report =
+            analyze_match_with_backend("a*", &long_run, &config, &AutomataBackend).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert_eq!(report.witness.unwrap().value, long_run);
+    }
+
+    /// Sanity check alongside the two regressions above: a pattern that
+    /// genuinely needs a second, never-revisited subset must still hit the
+    /// cap at `--max-states 1` -- the fix only changes *when* the cap is
+    /// checked, not what it allows.
+    #[test]
+    fn state_limit_still_applies_when_a_second_state_is_genuinely_needed() {
+        let config = Config {
+            max_product_states: 1,
+            ..Config::default()
+        };
+        let report = analyze_match_with_backend("ab", "ab", &config, &AutomataBackend).unwrap();
+        assert_eq!(report.verdict, Verdict::Unknown);
+        assert_eq!(report.diagnostic.id, "match.state_limit");
     }
 
     #[test]

@@ -11,6 +11,26 @@ All notable changes are documented here.
   the file (default `<kind>.pdf`); `--emit-dot` or a `.dot` suffix writes
   Graphviz source without invoking `dot`.
 
+- Fixed: `nfa_match_input` (the default `RelationBackend::match_input`, used
+  by `AutomataBackend`/`MinimizedBackend`/`AbstractionBackend` for
+  `Query::Match`) checked `seen.len() >= config.max_product_states` *before*
+  stepping on the current character, against the state count left over from
+  the *previous* character -- so it rejected a character it had never even
+  tried stepping on, regardless of whether that step would land on a brand
+  new subset or revisit one already seen (e.g. a self-loop). At
+  `--max-states 1`, the start subset alone already meets the cap, so *every*
+  non-empty input was rejected before the first character was ever read
+  (`match a a` → `UNKNOWN`, unconditionally); more generally, a pattern like
+  `a*` matching a long run of `a`s failed as soon as the cap was reached by
+  the *first* repetition, even though every later repetition revisits the
+  exact same subset and costs nothing further. `derivative.rs`'s
+  `ResidualInterner::intern` and `antimirov.rs`'s `LinearFormInterner::intern`
+  already had the correct shape for this (a revisit of an already-known
+  state always succeeds, even exactly at the cap; only a genuinely new state
+  checks it) -- `nfa_match_input` now follows the same pattern: compute the
+  next subset first, and only check the cap if that subset isn't already in
+  `seen`. Regression tests added in `analysis.rs`.
+
 - Fixed: `DerivativeBackend` and `AntimirovBackend`'s NFA-only entry points
   (`RelationBackend::analyze_binary`/`analyze_empty` -- distinct from
   `analyze_binary_expr`/`analyze_empty_expr`, which both backends genuinely
