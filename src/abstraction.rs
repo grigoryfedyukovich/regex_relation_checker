@@ -349,7 +349,7 @@ fn abstract_pair(left: &Expr, right: &Expr, map: &AbstractionMap) -> (Expr, Expr
 fn abstract_verdict(query: Query, result: &BackendResult) -> Option<bool> {
     // Returns Some(true) = YES, Some(false) = NO, None = inconclusive
     match result.status {
-        BackendStatus::StateLimit | BackendStatus::Timeout => None,
+        BackendStatus::StateLimit | BackendStatus::Timeout | BackendStatus::Unsupported => None,
         BackendStatus::Found => match query {
             Query::Overlap => Some(true),
             Query::Empty => Some(false), // word found → not empty
@@ -915,5 +915,22 @@ mod tests {
         .unwrap();
         assert_eq!(report.verdict, Verdict::Yes);
         assert_eq!(report.backend.name, "abstraction");
+    }
+
+    /// Regression test: `AbstractionBackend::analyze_binary` (the NFA-only
+    /// entry point) delegates straight to `self.inner.analyze_binary` --
+    /// bypassing CEGAR entirely, since there's no AST at this entry point
+    /// either. With a residual-expression inner (`DerivativeBackend`,
+    /// `AntimirovBackend`), that inner call used to silently come back as
+    /// `BackendStatus::Timeout`, and `AbstractionBackend` had no way to tell
+    /// that apart from a real search that ran out of budget. It must now
+    /// propagate `BackendStatus::Unsupported` unchanged.
+    #[test]
+    fn nfa_only_entry_point_propagates_unsupported_with_a_derivatives_inner() {
+        let cfg = Config::default();
+        let backend = AbstractionBackend::with_inner(crate::derivative::DerivativeBackend);
+        let nfa = Nfa::from_expr(&parse("a", &cfg).unwrap());
+        let result = backend.analyze_binary(Query::Equivalent, &nfa, &nfa, &cfg);
+        assert_eq!(result.status, BackendStatus::Unsupported);
     }
 }

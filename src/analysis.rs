@@ -60,6 +60,22 @@ pub enum BackendStatus {
     Exhausted,
     StateLimit,
     Timeout,
+    /// This entry point isn't implemented for the backend it was called on
+    /// -- a caller error (wrong method for this backend), not a resource
+    /// limit. Retrying with a larger `--max-states`/`--timeout-ms` will
+    /// never help. Currently only ever produced by [`DerivativeBackend`]
+    /// and [`AntimirovBackend`]'s [`analyze_binary`]/[`analyze_empty`]
+    /// (the NFA-only entry points), which those two backends cannot serve
+    /// -- they need the AST, so callers must use
+    /// [`analyze_binary_expr`]/[`analyze_empty_expr`] instead.
+    ///
+    /// [`DerivativeBackend`]: crate::derivative::DerivativeBackend
+    /// [`AntimirovBackend`]: crate::antimirov::AntimirovBackend
+    /// [`analyze_binary`]: RelationBackend::analyze_binary
+    /// [`analyze_empty`]: RelationBackend::analyze_empty
+    /// [`analyze_binary_expr`]: RelationBackend::analyze_binary_expr
+    /// [`analyze_empty_expr`]: RelationBackend::analyze_empty_expr
+    Unsupported,
 }
 
 pub trait RelationBackend {
@@ -67,6 +83,20 @@ pub trait RelationBackend {
 
     fn version(&self) -> &'static str;
 
+    /// NFA-only entry point. Backends whose analysis genuinely only needs
+    /// the compiled automaton (e.g. [`AutomataBackend`], [`MinimizedBackend`])
+    /// implement this directly. Backends that instead work from residual
+    /// expressions (e.g. Brzozowski derivatives, Antimirov partial
+    /// derivatives) cannot answer from an `Nfa` alone -- they override
+    /// [`analyze_binary_expr`] instead and return
+    /// [`BackendStatus::Unsupported`] here, since there is no AST to fall
+    /// back to at this entry point. Prefer calling `analyze_binary_expr`
+    /// (or the [`analyze_binary_with_backend`] helper, which always does)
+    /// unless you specifically know the backend only needs an `Nfa`.
+    ///
+    /// [`analyze_binary_expr`]: RelationBackend::analyze_binary_expr
+    /// [`AutomataBackend`]: crate::analysis::AutomataBackend
+    /// [`MinimizedBackend`]: crate::minimize::MinimizedBackend
     fn analyze_binary(
         &self,
         query: Query,
@@ -75,6 +105,13 @@ pub trait RelationBackend {
         config: &Config,
     ) -> BackendResult;
 
+    /// NFA-only emptiness entry point. See [`analyze_binary`] for the same
+    /// caveat: residual-expression backends return
+    /// [`BackendStatus::Unsupported`] here and need [`analyze_empty_expr`]
+    /// instead.
+    ///
+    /// [`analyze_binary`]: RelationBackend::analyze_binary
+    /// [`analyze_empty_expr`]: RelationBackend::analyze_empty_expr
     fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult;
 
     /// AST-aware entry point. Backends that work from residual expressions
@@ -676,6 +713,12 @@ fn report_from_match_outcome(
             "match.timeout",
             "analysis reached the configured timeout",
         ),
+        BackendStatus::Unsupported => (
+            Verdict::Unknown,
+            None,
+            "match.unsupported",
+            "this backend does not implement this entry point directly (internal error)",
+        ),
     };
     let mut report = base_report(
         Query::Match,
@@ -767,6 +810,12 @@ fn report_from_binary_outcome(
             "analysis reached the configured timeout",
             None,
         ),
+        BackendStatus::Unsupported => (
+            Verdict::Unknown,
+            "RR_UNSUPPORTED",
+            "this backend does not implement this entry point directly (internal error)",
+            None,
+        ),
     };
 
     base_report(
@@ -814,6 +863,12 @@ fn report_from_empty_outcome(
             Verdict::Unknown,
             "RR_TIMEOUT",
             "analysis reached the configured timeout",
+            None,
+        ),
+        BackendStatus::Unsupported => (
+            Verdict::Unknown,
+            "RR_UNSUPPORTED",
+            "this backend does not implement this entry point directly (internal error)",
             None,
         ),
     };

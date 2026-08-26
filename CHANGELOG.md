@@ -10,6 +10,31 @@ All notable changes are documented here.
   `minimized` Moore minimization in `minimize::minimize`. `--output` selects
   the file (default `<kind>.pdf`); `--emit-dot` or a `.dot` suffix writes
   Graphviz source without invoking `dot`.
+
+- Fixed: `DerivativeBackend` and `AntimirovBackend`'s NFA-only entry points
+  (`RelationBackend::analyze_binary`/`analyze_empty` -- distinct from
+  `analyze_binary_expr`/`analyze_empty_expr`, which both backends genuinely
+  implement) had no AST to derive from and always claimed
+  `BackendStatus::Timeout` unconditionally, regardless of `config.timeout_ms`
+  or whether any work was attempted at all. The normal CLI/library path
+  (`analyze_binary_with_backend`) always calls `analyze_binary_expr`, so this
+  was invisible there -- but any direct caller of the NFA-only trait methods
+  on these two backends, or of `AbstractionBackend::analyze_binary` (which
+  delegates straight to `self.inner.analyze_binary`, bypassing CEGAR
+  entirely since there's no AST at that entry point either) with a
+  derivatives/antimirov inner, got a plausible-looking `Verdict::Unknown`
+  indistinguishable from a real search that ran and genuinely exhausted its
+  budget. Fixed by adding `BackendStatus::Unsupported` -- a caller-error
+  signal distinct from any resource limit, since retrying with a larger
+  budget would never help -- and returning it from all four stubs instead.
+  Updated the three exhaustive `BackendStatus` matches in `analysis.rs`
+  (report rendering for match/binary/empty outcomes) and the one in
+  `abstraction.rs` (`abstract_verdict`, where it's folded into the existing
+  `StateLimit | Timeout => None` inconclusive case) to handle the new
+  variant; the compiler's exhaustiveness check confirmed there were no
+  others. Regression tests added in `derivative.rs`, `antimirov.rs`, and
+  `abstraction.rs`.
+
 - Fixed: `minimize.rs`'s `alphabet_partition` added a boundary after an
   interval's end only when `end < 0x10ffff`, so under `--alphabet unicode`
   an interval ending exactly at `U+10FFFF` got no trailing boundary. Because

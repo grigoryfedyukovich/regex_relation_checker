@@ -762,9 +762,13 @@ impl RelationBackend for DerivativeBackend {
         _right: &Nfa,
         _config: &Config,
     ) -> BackendResult {
-        // Prefer analyze_binary_expr; this path has no AST and cannot derive.
+        // This backend only knows how to derive from an AST -- there's no
+        // way to answer from an `Nfa` alone. `Unsupported` (never `Timeout`)
+        // says so plainly: this didn't run out of budget, it never ran.
+        // Callers must go through `analyze_binary_expr` instead (the normal
+        // CLI/library path always does, via `analyze_binary_with_backend`).
         BackendResult {
-            status: BackendStatus::Timeout,
+            status: BackendStatus::Unsupported,
             witness: None,
             relation: None,
             visited_states: 0,
@@ -775,8 +779,9 @@ impl RelationBackend for DerivativeBackend {
     }
 
     fn analyze_empty(&self, _nfa: &Nfa, _config: &Config) -> BackendResult {
+        // Same reasoning as `analyze_binary` above: use `analyze_empty_expr`.
         BackendResult {
-            status: BackendStatus::Timeout,
+            status: BackendStatus::Unsupported,
             witness: None,
             relation: None,
             visited_states: 0,
@@ -971,6 +976,25 @@ mod tests {
             left,
             right
         );
+    }
+
+    /// Regression test: the NFA-only entry points on this backend cannot
+    /// derive (there's no AST to work from), and used to silently claim
+    /// `BackendStatus::Timeout` -- indistinguishable from a real search that
+    /// ran and genuinely ran out of budget. A direct caller of
+    /// `RelationBackend::analyze_binary`/`analyze_empty` (bypassing the
+    /// normal `analyze_binary_expr`/`analyze_empty_expr` path that
+    /// `analyze_binary_with_backend` always uses) got a plausible-looking
+    /// `Verdict::Unknown` with no indication the analysis never actually
+    /// ran. Both must now report `BackendStatus::Unsupported` instead.
+    #[test]
+    fn nfa_only_entry_points_report_unsupported_not_timeout() {
+        let config = Config::default();
+        let nfa = Nfa::from_expr(&parse("a", &config).unwrap());
+        let binary = DerivativeBackend.analyze_binary(Query::Equivalent, &nfa, &nfa, &config);
+        assert_eq!(binary.status, BackendStatus::Unsupported);
+        let empty = DerivativeBackend.analyze_empty(&nfa, &config);
+        assert_eq!(empty.status, BackendStatus::Unsupported);
     }
 
     #[test]
