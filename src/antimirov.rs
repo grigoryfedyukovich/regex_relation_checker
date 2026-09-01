@@ -16,271 +16,15 @@
 //! Finite Automaton Constructions" (Theoretical Computer Science, 1996).
 
 use crate::analysis::{BackendResult, BackendStatus, Query, RelationBackend};
-use crate::ast::{Expr, ExprKind};
-use crate::charset::CharSet;
+use crate::ast::Expr;
+use crate::charset::{representative_chars, CharSet};
 use crate::config::Config;
 use crate::nfa::Nfa;
 use crate::report::relation;
-use std::cmp::Ordering;
+use crate::residual::{dead_end_verdict, from_expr, reg_ord, Reg, RegKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-
-// ---------------------------------------------------------------------------
-// Residual algebra (shared shape with the Brzozowski backend)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum RegKind {
-    Null,
-    Eps,
-    Atom(CharSet),
-    Concat(Vec<Reg>),
-    Alt(Vec<Reg>),
-    Star(Reg),
-}
-
-/// Computes a `RegKind`'s hash once, at construction time (see `Reg::wrap`).
-///
-/// This is the basis for hash-consing `Reg`: because `RegKind`'s derived
-/// `Hash` impl hashes its `Vec<Reg>`/`Reg` fields through *their* `Hash`
-/// impl, and `Reg::hash` (below) is overridden to just return this cached
-/// value in O(1), computing a *new* parent node's hash only means
-/// combining its immediate children's already-cached hashes -- not
-/// re-walking their entire subtrees. Without this, hashing the same large
-/// shared subterm repeatedly (e.g. as a `HashSet<Reg>` member during
-/// dedup, or as part of a `(Reg, char)` cache key, both on the hot path
-/// for wide linear forms) costs O(size) *every single time*, hit or miss.
-fn compute_hash(kind: &RegKind) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    kind.hash(&mut hasher);
-    hasher.finish()
-}
-
-#[derive(Clone, Debug)]
-struct Reg(Rc<(RegKind, u64)>);
-
-impl Reg {
-    fn kind(&self) -> &RegKind {
-        &self.0.as_ref().0
-    }
-    /// Build a `Reg` from a fresh `RegKind`, computing and caching its
-    /// hash once. Every smart constructor below goes through this instead
-    /// of `Self(Rc::new(...))` directly.
-    fn wrap(kind: RegKind) -> Self {
-        let h = compute_hash(&kind);
-        Self(Rc::new((kind, h)))
-    }
-
-    fn null() -> Self {
-        Self::wrap(RegKind::Null)
-    }
-    fn eps() -> Self {
-        Self::wrap(RegKind::Eps)
-    }
-    fn atom(set: CharSet) -> Self {
-        if set.is_empty() {
-            Self::null()
-        } else {
-            Self::wrap(RegKind::Atom(set))
-        }
-    }
-    fn star(inner: Reg) -> Self {
-        match inner.kind() {
-            RegKind::Null | RegKind::Eps => Self::eps(),
-            RegKind::Star(_) => inner,
-            _ => Self::wrap(RegKind::Star(inner)),
-        }
-    }
-    fn concat(parts: Vec<Reg>) -> Self {
-        let mut flat = Vec::new();
-        for part in parts {
-            match part.kind() {
-                RegKind::Null => return Self::null(),
-                RegKind::Eps => {}
-                RegKind::Concat(inner) => flat.extend(inner.iter().cloned()),
-                _ => flat.push(part),
-            }
-        }
-        match flat.len() {
-            0 => Self::eps(),
-            1 => flat.pop().unwrap(),
-            _ => Self::wrap(RegKind::Concat(flat)),
-        }
-    }
-    fn alt(branches: Vec<Reg>) -> Self {
-        let mut flat = Vec::new();
-        for b in branches {
-            match b.kind() {
-                RegKind::Null => {}
-                RegKind::Alt(inner) => flat.extend(inner.iter().cloned()),
-                _ => flat.push(b),
-            }
-        }
-        flat.sort_by(reg_ord);
-        flat.dedup();
-        match flat.len() {
-            0 => Self::null(),
-            1 => flat.pop().unwrap(),
-            _ => Self::wrap(RegKind::Alt(flat)),
-        }
-    }
-
-    fn nullable(&self) -> bool {
-        match self.kind() {
-            RegKind::Null | RegKind::Atom(_) => false,
-            RegKind::Eps | RegKind::Star(_) => true,
-            RegKind::Concat(parts) => parts.iter().all(Reg::nullable),
-            RegKind::Alt(branches) => branches.iter().any(Reg::nullable),
-        }
-    }
-
-    fn first_sets(&self, out: &mut Vec<CharSet>) {
-        match self.kind() {
-            RegKind::Null | RegKind::Eps => {}
-            RegKind::Atom(set) => out.push(set.clone()),
-            RegKind::Concat(parts) => {
-                for p in parts {
-                    p.first_sets(out);
-                    if !p.nullable() {
-                        break;
-                    }
-                }
-            }
-            RegKind::Alt(branches) => {
-                for b in branches {
-                    b.first_sets(out);
-                }
-            }
-            RegKind::Star(inner) => inner.first_sets(out),
-        }
-    }
-
-    /// Concatenate `self` on the left of `tail`, with normalization.
-    fn then(self, tail: Reg) -> Reg {
-        Reg::concat(vec![self, tail])
-    }
-}
-
-impl std::hash::Hash for Reg {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // O(1): just the cached hash, never a tree walk. See `compute_hash`.
-        self.0.as_ref().1.hash(state);
-    }
-}
-
-impl PartialEq for Reg {
-    fn eq(&self, other: &Self) -> bool {
-        // Fast rejection on the cached hash before ever touching the
-        // (potentially large) `RegKind` comparison. The `RegKind` compare
-        // only runs when hashes already match -- true equality, or an
-        // astronomically rare 64-bit collision.
-        self.0.as_ref().1 == other.0.as_ref().1 && self.0.as_ref().0 == other.0.as_ref().0
-    }
-}
-impl Eq for Reg {}
-
-fn reg_ord(a: &Reg, b: &Reg) -> Ordering {
-    use RegKind::*;
-    fn rank(k: &RegKind) -> u8 {
-        match k {
-            Null => 0,
-            Eps => 1,
-            Atom(_) => 2,
-            Concat(_) => 3,
-            Alt(_) => 4,
-            Star(_) => 5,
-        }
-    }
-    let (ka, kb) = (a.kind(), b.kind());
-    match rank(ka).cmp(&rank(kb)) {
-        Ordering::Equal => {}
-        o => return o,
-    }
-    match (ka, kb) {
-        (Atom(sa), Atom(sb)) => {
-            let ia = sa.intervals();
-            let ib = sb.intervals();
-            match ia.len().cmp(&ib.len()) {
-                Ordering::Equal => {}
-                o => return o,
-            }
-            for (x, y) in ia.iter().zip(ib.iter()) {
-                match (x.start, x.end).cmp(&(y.start, y.end)) {
-                    Ordering::Equal => {}
-                    o => return o,
-                }
-            }
-            Ordering::Equal
-        }
-        (Concat(pa), Concat(pb)) | (Alt(pa), Alt(pb)) => {
-            // Length first, *then* elementwise -- confirmed via direct
-            // instrumentation (not just bench pass/fail, which can't tell
-            // "faster but still over budget" from "no effect") to be
-            // where `from_parts`'s sort spends most of its time on chains
-            // like 500 concatenated `a?`s: comparing two different-length
-            // Concat chains built from the same repeated element walks
-            // every shared element (all trivially equal) before ever
-            // reaching the part that actually distinguishes them.
-            match pa.len().cmp(&pb.len()) {
-                Ordering::Equal => {}
-                o => return o,
-            }
-            for (x, y) in pa.iter().zip(pb.iter()) {
-                match reg_ord(x, y) {
-                    Ordering::Equal => {}
-                    o => return o,
-                }
-            }
-            Ordering::Equal
-        }
-        (Star(ia), Star(ib)) => reg_ord(ia, ib),
-        _ => Ordering::Equal,
-    }
-}
-
-fn from_expr(expr: &Expr) -> Reg {
-    match &expr.kind {
-        ExprKind::Empty | ExprKind::AnchorStart | ExprKind::AnchorEnd => Reg::eps(),
-        ExprKind::Literal(ch) => Reg::atom(CharSet::singleton(*ch)),
-        ExprKind::CharSet(set) => Reg::atom(set.clone()),
-        ExprKind::Concat(parts) => {
-            if parts.is_empty() {
-                Reg::eps()
-            } else {
-                Reg::concat(parts.iter().map(from_expr).collect())
-            }
-        }
-        ExprKind::Alt(branches) => {
-            if branches.is_empty() {
-                Reg::null()
-            } else {
-                Reg::alt(branches.iter().map(from_expr).collect())
-            }
-        }
-        ExprKind::Repeat { expr, min, max } => expand_repeat(from_expr(expr), *min, *max),
-    }
-}
-
-fn expand_repeat(inner: Reg, min: usize, max: Option<usize>) -> Reg {
-    let mut parts = Vec::new();
-    for _ in 0..min {
-        parts.push(inner.clone());
-    }
-    match max {
-        None => {
-            parts.push(Reg::star(inner));
-            Reg::concat(parts)
-        }
-        Some(maximum) => {
-            for _ in min..maximum {
-                parts.push(Reg::alt(vec![Reg::eps(), inner.clone()]));
-            }
-            Reg::concat(parts)
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Linear forms = finite sets of residuals (Antimirov)
@@ -755,25 +499,6 @@ fn partial_der_form(
     RawForm::union_many(form.0.iter().map(|r| partial_der(r, ch, cache)).collect()).flatten()
 }
 
-fn representative_chars(sets: &[CharSet]) -> Vec<char> {
-    let mut boundaries: Vec<u32> = Vec::new();
-    for set in sets {
-        for interval in set.intervals() {
-            boundaries.push(interval.start);
-            if interval.end < 0x10ffff {
-                boundaries.push(interval.end + 1);
-            }
-        }
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .into_iter()
-        .filter_map(char::from_u32)
-        .filter(|ch| sets.iter().any(|set| set.contains(*ch)))
-        .collect()
-}
-
 fn classify_relation(
     query: Query,
     left_accepts: bool,
@@ -788,16 +513,11 @@ fn classify_relation(
     }
 }
 
-/// Empty linear form is the absorbing dead language on that side.
+/// Empty linear form is the absorbing dead language on that side. See
+/// `dead_end_verdict`'s doc comment (shared with `derivative::is_dead_end`)
+/// for the query-specific pruning argument itself.
 fn is_dead_end(query: Query, left: &LinearForm, right: &LinearForm) -> bool {
-    let left_dead = left.is_empty();
-    let right_dead = right.is_empty();
-    match query {
-        Query::Overlap => left_dead || right_dead,
-        Query::Includes => left_dead,
-        Query::Equivalent => left_dead && right_dead,
-        Query::Empty | Query::Match => false,
-    }
+    dead_end_verdict(query, left.is_empty(), right.is_empty())
 }
 
 fn stopped_result(

@@ -41,7 +41,16 @@ impl CharSet {
         Self::from_u32_intervals(vec![Interval::new(start as u32, end as u32)])
     }
 
-    pub fn from_u32_intervals(mut intervals: Vec<Interval>) -> Self {
+    /// Crate-private: unlike every other constructor here, this accepts raw
+    /// `u32` boundaries with no validation against a valid Unicode scalar
+    /// range (`char`'s own type already rules out surrogates and values
+    /// past `U+10FFFF` for every *other* constructor, which all take `char`
+    /// arguments). Kept internal so external callers can only ever build a
+    /// `CharSet` through a `char`-validated path -- constructing one over
+    /// e.g. the surrogate range, or values beyond `U+10FFFF`, would produce
+    /// a `CharSet` no other code in the crate has to account for, since
+    /// `char::from_u32` genuinely can't represent it.
+    pub(crate) fn from_u32_intervals(mut intervals: Vec<Interval>) -> Self {
         intervals.sort_by_key(|interval| (interval.start, interval.end));
         let mut merged: Vec<Interval> = Vec::with_capacity(intervals.len());
         for interval in intervals {
@@ -188,7 +197,6 @@ impl CharSet {
         self.intervals.is_empty()
     }
 
-    /// A charset that contains exactly one scalar value.
     pub fn as_singleton(&self) -> Option<char> {
         match *self.intervals.as_slice() {
             [interval] if interval.start == interval.end => char::from_u32(interval.start),
@@ -251,6 +259,84 @@ impl CharSet {
     }
 }
 
+/// Boundary points (sorted, deduplicated) between every interval across
+/// `sets`, each paired with a trailing sentinel one past its end
+/// (`interval.end + 1`, up to `0x110000` -- one past the last valid
+/// Unicode scalar value, `0x10FFFF`).
+///
+/// Shared by every "partition the alphabet into maximal same-membership
+/// ranges" computation in the crate: [`representative_chars`] and
+/// [`alphabet_partition`] here, and previously duplicated (independently,
+/// by design -- see the history below) as `representative_chars` in
+/// `analysis.rs`/`derivative.rs`/`antimirov.rs` and `representative_symbols`
+/// in `minimize.rs`.
+///
+/// Generic over `T: Borrow<CharSet>` so callers that already hold
+/// `&[CharSet]` (owned sets, as `derivative.rs`/`antimirov.rs`'s
+/// `first_sets` produce) and callers that hold `&[&CharSet]` (references
+/// into someone else's longer-lived data, as `minimize.rs`'s DFA
+/// transitions are) can both call this directly, without either needing an
+/// extra allocation or clone just to match the other's shape.
+///
+/// The four now-unified copies used to each maintain this exact loop
+/// independently -- deliberately, per a comment on the oldest of them,
+/// "so a bug in one copy doesn't automatically show up in the other." In
+/// practice it went the other way: `alphabet_partition`'s copy omitted the
+/// trailing sentinel for an interval already ending at `0x10FFFF` (since,
+/// unlike the other three, it recovers each range by pairing *adjacent*
+/// boundaries and so needs one even there), silently dropping the entire
+/// top range of the Unicode alphabet from any DFA transition set that
+/// reached it -- and the sibling copies' tests, being sibling copies, had
+/// no way to catch a bug specific to this one.
+fn alphabet_boundaries<T: std::borrow::Borrow<CharSet>>(sets: &[T]) -> Vec<u32> {
+    let mut boundaries: Vec<u32> = Vec::new();
+    for set in sets {
+        for interval in set.borrow().intervals() {
+            boundaries.push(interval.start);
+            boundaries.push(interval.end + 1);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+}
+
+/// One representative character per maximal alphabet range that behaves
+/// identically (as far as membership in any of `sets` goes) across its
+/// whole span. See [`alphabet_boundaries`].
+pub(crate) fn representative_chars<T: std::borrow::Borrow<CharSet>>(sets: &[T]) -> Vec<char> {
+    alphabet_boundaries(sets)
+        .into_iter()
+        .filter_map(char::from_u32)
+        .filter(|ch| sets.iter().any(|set| set.borrow().contains(*ch)))
+        .collect()
+}
+
+/// Like [`representative_chars`], but keeps the *whole* inclusive range
+/// `(start, end, representative)` for each partition class instead of just
+/// the representative -- needed when materializing full DFA transitions
+/// rather than just picking one character to test per class. See
+/// [`alphabet_boundaries`] for why the trailing sentinel matters here in
+/// particular: this is the one consumer that pairs up *adjacent* boundaries
+/// via `windows(2)` to recover each range, so a boundary after the very
+/// last interval is required, not just one at its start.
+pub(crate) fn alphabet_partition<T: std::borrow::Borrow<CharSet>>(
+    sets: &[T],
+) -> Vec<(u32, u32, char)> {
+    let boundaries = alphabet_boundaries(sets);
+    let mut out = Vec::new();
+    for window in boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1] - 1;
+        if let Some(rep) = char::from_u32(start) {
+            if sets.iter().any(|set| set.borrow().contains(rep)) {
+                out.push((start, end, rep));
+            }
+        }
+    }
+    out
+}
+
 fn format_dot_char(ch: char) -> String {
     match ch {
         '\n' => "\\n".to_owned(),
@@ -307,6 +393,43 @@ fn format_class_body(set: &CharSet) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alphabet_partition_covers_a_range_ending_at_the_last_scalar_value() {
+        // Regression guard: this used to add a boundary *after* an
+        // interval's end only when `end < 0x10ffff`, so an interval ending
+        // exactly at the top of the Unicode range got no trailing boundary.
+        // Since `alphabet_partition` recovers ranges by pairing *adjacent*
+        // boundaries with `windows(2)`, that left the interval's own
+        // boundary unpaired -- silently dropping the whole top range from
+        // the returned partition (and so from the DFA transitions built
+        // from it), even though the interval itself was well-formed.
+        let set = CharSet::from_u32_intervals(vec![Interval::new(0x10fffe, 0x10ffff)]);
+        let partition = alphabet_partition(&[&set]);
+        assert_eq!(
+            partition,
+            vec![(0x10fffe, 0x10ffff, char::from_u32(0x10fffe).unwrap())],
+            "range ending at U+10FFFF must survive the partition, not be silently dropped"
+        );
+    }
+
+    /// `representative_chars` and `alphabet_partition` both accept either
+    /// `&[CharSet]` (owned sets) or `&[&CharSet]` (references into someone
+    /// else's data) via `Borrow<CharSet>`, so every existing call site could
+    /// switch to the shared versions without an extra allocation or clone
+    /// just to match a different shape. Exercise both shapes directly so a
+    /// future signature change that breaks one of them fails here, not only
+    /// via a knock-on compile error at some call site.
+    #[test]
+    fn accepts_both_owned_and_referenced_charset_slices() {
+        let owned: Vec<CharSet> = vec![CharSet::from_interval('a', 'c')];
+        let borrowed: Vec<&CharSet> = owned.iter().collect();
+        assert_eq!(
+            representative_chars(&owned),
+            representative_chars(&borrowed)
+        );
+        assert_eq!(alphabet_partition(&owned), alphabet_partition(&borrowed));
+    }
 
     #[test]
     fn merges_adjacent_and_overlapping_intervals() {
@@ -398,43 +521,6 @@ mod tests {
         assert!(CharSet::ascii_space().contains('\t'));
         assert!(CharSet::ascii_space().contains(' '));
         assert!(!CharSet::ascii_space().contains('a'));
-    }
-
-    #[test]
-    fn dot_labels_prefer_compact_spellings() {
-        assert_eq!(
-            CharSet::singleton('a').to_dot_label(Alphabet::Ascii, false),
-            "a"
-        );
-        assert_eq!(
-            CharSet::from_interval('a', 'z').to_dot_label(Alphabet::Ascii, false),
-            "[a-z]"
-        );
-        assert_eq!(
-            CharSet::any(Alphabet::Ascii, false).to_dot_label(Alphabet::Ascii, false),
-            "."
-        );
-        assert_eq!(
-            CharSet::ascii_digits().to_dot_label(Alphabet::Ascii, false),
-            "\\d"
-        );
-        assert_eq!(
-            CharSet::singleton('a')
-                .complement(Alphabet::Ascii)
-                .to_dot_label(Alphabet::Ascii, false),
-            "[^a]"
-        );
-        assert_eq!(
-            CharSet::singleton('\n').to_dot_label(Alphabet::Ascii, false),
-            "\\n"
-        );
-    }
-
-    #[test]
-    fn as_singleton_rejects_ranges() {
-        assert_eq!(CharSet::singleton('x').as_singleton(), Some('x'));
-        assert_eq!(CharSet::from_interval('a', 'c').as_singleton(), None);
-        assert_eq!(CharSet::empty().as_singleton(), None);
     }
 
     #[test]

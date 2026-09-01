@@ -4,12 +4,129 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Fixed: CEGAR `build_initial_map` treated the entire pattern as a common
+  subexpression whenever both sides shared a root (including any identical
+  pair). Round 1 replaced each side with a single fresh marker, so abstract
+  YES was trivial but `expand_witness` had to solve the original language —
+  Θ(2ⁿ) NFA subset construction for `(a|b)*a(a|b){n}`. That burned the
+  shared `--timeout-ms` budget, after which `budget_config` refused the
+  useful refinement round and reported `UNKNOWN` with `product=0` on
+  `hard_cegar_overlap__nth26-self`. Roots of either pattern are no longer
+  abstracted; shared *proper* subexpressions still are (the skeleton `σaτ`
+  for that family, 4 product states). Regression tests in `abstraction.rs`.
+
 - Added `--draw <nfa|dfa|minimized>` (and the equivalent `draw` subcommand) to
   dump a Graphviz PDF of a single regex. `nfa` uses the Thompson ε-NFA,
   `dfa` the existing subset construction in `minimize::determinize`, and
   `minimized` Moore minimization in `minimize::minimize`. `--output` selects
   the file (default `<kind>.pdf`); `--emit-dot` or a `.dot` suffix writes
   Graphviz source without invoking `dot`.
+
+- Unified: `derivative.rs` and `antimirov.rs` each defined their own, fully
+  independent copy of the residual-expression term algebra --
+  `Reg`/`RegKind` (hash-consed via `Rc` for O(1) hash/equality), the smart
+  constructors (`null`/`eps`/`atom`/`star`/`concat`/`alt`), `nullable`,
+  `first_sets`, `reg_ord`, `from_expr`, and `expand_repeat` -- structurally
+  identical (down to matching doc comments in most cases) but maintained
+  separately. They had already drifted: `antimirov.rs`'s `Reg::alt` was
+  still doing the older, slower sort-then-dedup, while `derivative.rs`'s
+  copy had been upgraded to hash-based dedup-then-sort (a documented,
+  deliberate optimization once hashing a `Reg` became O(1)) that was never
+  ported over; `expand_repeat`'s `Vec::with_capacity` sizing hint had
+  likewise only made it into one copy. Neither drift changed either
+  backend's answers -- both were performance-only -- but nothing prevented
+  a future one from being more than that, and two copies whose whole
+  premise is independence have no way to catch it if it happens. Extracted
+  the shared algebra into a new `residual.rs` module (both backends'
+  algorithm-specific logic -- `Reg::derivative`'s single-residual step,
+  `partial_der`/`LinearForm`'s set-of-residuals step, and each backend's
+  own `*Interner` -- stays put; only the genuinely-identical term algebra
+  moved) and added `dead_end_verdict`, factoring out the query-specific
+  pruning decision `derivative::is_dead_end`/`antimirov::is_dead_end` each
+  re-implemented identically over their own notion of "dead" (a lone `Reg`
+  vs. an empty `LinearForm`). `--backend derivatives`/`--backend antimirov`
+  bench runs are unchanged (0 FAIL either way, same OK/LIMIT split as
+  before the refactor), as expected for a pure deduplication.
+
+- Unified: four independent copies of the same alphabet-partitioning loop
+  -- `representative_chars` in `analysis.rs`/`derivative.rs`/`antimirov.rs`
+  and `representative_symbols`/`alphabet_partition` in `minimize.rs` --
+  were the direct cause of the `alphabet_partition` boundary bug further
+  down this changelog: three of the four copies happened to be correct for
+  their own use case, so only the fourth's test coverage could have caught
+  its bug, and didn't need to. Extracted one canonical
+  `representative_chars`/`alphabet_partition` pair into `charset.rs`,
+  generic over `T: Borrow<CharSet>` so callers holding either `&[CharSet]`
+  (owned sets, as `derivative.rs`/`antimirov.rs`'s `first_sets` produce) or
+  `&[&CharSet]` (references into longer-lived data, as `minimize.rs`'s DFA
+  transitions are) can call it directly, with no extra allocation either
+  way. `minimize.rs`, `analysis.rs`, `derivative.rs`, and `antimirov.rs`
+  all now use the shared versions; their own copies are gone.
+
+- Hardened: `Expr`/`ExprKind` (`ast.rs`) and `CharSet::from_u32_intervals`
+  (`charset.rs`) were fully public, so an external library caller could
+  hand-construct an AST or character set bypassing every invariant the
+  parser normally enforces -- e.g. `ExprKind::Alt(vec![])` (an alternation
+  with zero branches; the parser can't produce one, and not everything
+  downstream necessarily expects one) or a `CharSet` built directly over
+  the UTF-16 surrogate range or values past `U+10FFFF` (impossible via any
+  `char`-based constructor, since `char` itself excludes both, but
+  `from_u32_intervals` takes raw `u32` boundaries with no such check).
+  `Expr::new` and `CharSet::from_u32_intervals` are now `pub(crate)`, and
+  `ExprKind` is `#[non_exhaustive]`: external code can still parse a
+  pattern and inspect the resulting `Expr` (match non-exhaustively, walk
+  `.span`), but can no longer construct one bypassing the parser. Caught a
+  real instance of exactly this on the first build: `tests/property.rs` (a
+  separate compilation unit, and so "external" to the library crate in
+  exactly the sense this change targets) had an intentionally-exhaustive
+  match over `ExprKind` as its own independent reference interpreter;
+  fixed with a documented wildcard arm that only ever fires if the library
+  grows a variant that reference interpreter hasn't been taught to walk.
+
+- Documented: a `{` that doesn't form a valid `{m}`/`{m,}`/`{m,n}` counted
+  repetition (reversed bounds, a non-numeric body, unterminated) is a hard
+  syntax error here, not a literal `{` -- unlike JS, Python, and Rust's own
+  `regex` crate, which all fall back to treating unparseable `{...}` as a
+  literal character. Noted as a deliberate divergence (catching a likely
+  typo beats silently reinterpreting it) in `docs/semantics.md` and the
+  `regexrel syntax` CLI text, rather than changed to match those engines.
+
+- Added: `\b` inside a character class (`[\b]`) is now the literal
+  backspace character, `U+0008` -- the reading every mainstream engine
+  (JS, Python, PCRE, ICU, .NET, Rust's `regex` crate) gives it, since a
+  zero-width word-boundary assertion has no meaning as one member of a
+  character set. Previously rejected unconditionally: `\b` was only ever
+  special-cased outside a class (where it remains the unsupported
+  word-boundary assertion), so inside one it fell through to the generic
+  "unsupported escape" error instead. `SYNTAX_HELP` updated to note the
+  in-class reading explicitly.
+
+- Fixed: `AbstractionBackend::analyze_binary_expr`'s shared-deadline helper,
+  `budget_config`, computed each round's remaining budget as
+  `config.timeout_ms.saturating_sub(elapsed_ms).max(1)` -- the `.max(1)`
+  meant it could never actually report the budget as exhausted, only ever
+  clamp down to a minimum of 1ms and hand that back as a normal, usable
+  config. A call already past its deadline still got a (tiny but nonzero)
+  budget and launched another round of real work regardless, and that round
+  itself could take meaningfully longer than 1ms to notice its own budget
+  was gone before the *next* `budget_config` call repeated the same
+  mistake -- up to `MAX_REFINEMENT_ROUNDS + 1` times. The existing
+  regression test for the sibling bug this shared-deadline mechanism was
+  originally built to fix only asserted `elapsed < 400` for a 50ms budget,
+  loose enough not to catch this. Fixed by changing `budget_config` to
+  return `Option<Config>` -- `None` once `elapsed_ms >= config.timeout_ms`,
+  forcing every call site to handle "stop now" explicitly rather than
+  silently being handed a workable-looking config -- and adding
+  `timeout_result`/`concrete_fallback` helpers so all six call sites (the
+  main refinement loop, witness expansion, and four identical "give up,
+  run the original patterns" exits, now de-duplicated into one) return a
+  proper `BackendStatus::Timeout` immediately instead of launching more
+  work. `max_product_states` remains per-round, not cumulative, across
+  these same rounds -- already tracked as a separate, deliberately-deferred
+  item in `docs/limitations.md` and out of scope here. Tightened the
+  existing wall-clock test's threshold and added a deterministic regression
+  test in `abstraction.rs` that calls `budget_config` directly with an
+  artificially backdated start time (no timing race).
 
 - Fixed: `nfa_match_input` (the default `RelationBackend::match_input`, used
   by `AutomataBackend`/`MinimizedBackend`/`AbstractionBackend` for

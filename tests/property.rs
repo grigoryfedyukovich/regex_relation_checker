@@ -208,6 +208,14 @@ fn positions_after(expr: &Expr, chars: &[char], positions: &BTreeSet<usize>) -> 
             }
             union
         }
+        // `ExprKind` is `#[non_exhaustive]` from this (external, since
+        // `tests/` is its own compilation unit) crate's point of view, so
+        // the compiler requires this arm even though every variant that
+        // exists today is already handled above. Reaching it for real would
+        // mean the library grew a 9th variant this independent reference
+        // interpreter doesn't yet know how to walk -- a real coverage gap
+        // to fix here, not something to silently ignore.
+        other => unreachable!("positions_after: unhandled ExprKind variant {other:?}"),
     }
 }
 

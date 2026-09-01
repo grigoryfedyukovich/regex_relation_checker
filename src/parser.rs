@@ -389,6 +389,15 @@ impl<'a> Parser<'a> {
                     span,
                 ));
             }
+            // Outside a class, `\b` is the word-boundary assertion (a
+            // zero-width lookaround, not a regular-language construct, so
+            // unsupported here like the other assertions below). Inside a
+            // class it can only ever mean a literal character -- a boundary
+            // assertion has no meaning as one member of a character set --
+            // and every mainstream engine (JS, Python, PCRE, ICU, .NET,
+            // Rust's `regex` crate) takes `[\b]` to mean the single
+            // backspace character, U+0008, on exactly that basis.
+            'b' if in_class => '\u{0008}',
             'b' if !in_class => {
                 return Err(FrontendError::unsupported(
                     "word-boundary assertions are not supported",
@@ -595,9 +604,19 @@ Atoms:
 Quantifiers:
   *, +, ?, {m}, {m,}, {m,n}
 
+A `{` that doesn't form one of those three forms (reversed bounds, a
+non-numeric body, unterminated) is a syntax error, not a literal `{` --
+unlike JS, Python, and Rust's `regex` crate. Escape it (\{) for a literal.
+
 Not supported:
   backreferences, lookaround, inline flags, lazy/possessive quantifiers,
-  word-boundary assertions, Unicode property escapes, or PCRE conditionals.
+  word-boundary assertions (\b outside a class), Unicode property escapes,
+  or PCRE conditionals.
+
+Inside a class, \b has no meaning as a boundary assertion and instead
+matches the literal backspace character U+0008 -- e.g. [\b] -- the same
+reading every mainstream engine (JS, Python, PCRE, ICU, .NET, Rust's
+`regex` crate) gives it, for the same reason.
 
 ASCII mode gives \d/\w/\s their ASCII meanings. Unicode mode expands the
 alphabet for literals, dot, and negated classes, but those shorthand classes
@@ -779,6 +798,33 @@ mod tests {
         let unknown = parse(r"\q", &Config::default()).unwrap_err();
         assert_eq!(unknown.kind, FrontendErrorKind::Unsupported);
         assert!(unknown.hint.is_some());
+    }
+
+    /// `\b` outside a class is the (unsupported) word-boundary assertion,
+    /// but every mainstream engine (JS, Python, PCRE, ICU, .NET, Rust's
+    /// `regex` crate) takes `[\b]` to mean the literal backspace character,
+    /// U+0008, precisely because a zero-width assertion has no meaning as
+    /// one member of a character set. This parser used to reject `\b`
+    /// unconditionally, even inside a class, falling through to the generic
+    /// "unsupported escape" error instead of treating it as a literal.
+    #[test]
+    fn class_backspace_escape_is_a_literal_not_unsupported() {
+        let expr = parse(r"[\b]", &Config::default()).unwrap();
+        let ExprKind::CharSet(set) = &expr.kind else {
+            panic!("expected a CharSet, got {expr:?}");
+        };
+        assert!(set.contains('\u{0008}'));
+        assert_eq!(
+            set.intervals().len(),
+            1,
+            "expected exactly one member: U+0008"
+        );
+
+        // Outside a class, the same escape is still the unsupported
+        // word-boundary assertion -- this fix only changes the in-class
+        // reading, not the bare one.
+        let boundary = parse(r"\b", &Config::default()).unwrap_err();
+        assert_eq!(boundary.kind, FrontendErrorKind::Unsupported);
     }
 
     #[test]

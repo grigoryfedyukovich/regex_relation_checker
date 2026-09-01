@@ -329,9 +329,26 @@ fn build_initial_map(left: &Expr, right: &Expr, max_abstractions: usize) -> Abst
     // deterministic across runs, independent of HashMap iteration order.
     common.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
+    let left_root = structural_key(&left_n);
+    let right_root = structural_key(&right_n);
     let mut map = AbstractionMap::default();
     let mut next_fresh = FRESH_BASE;
-    for (_, expr, score) in common.into_iter().take(max_abstractions) {
+    for (key, expr, score) in common.into_iter() {
+        // Abstracting a pattern's own root to one marker makes the abstract
+        // query trivial, but `expand_witness` then has to produce a word of
+        // that whole language. For identical nth-from-end patterns that is
+        // the original Θ(2ⁿ) subset construction, which burns the shared
+        // timeout so the useful refinement round never runs (UNKNOWN with
+        // product=0 on `hard_cegar_overlap__nth26-self`). Skip roots;
+        // shared *proper* subexpressions still collapse — e.g. `(a|b)*`
+        // and `(a|b){n}` inside `(a|b)*a(a|b){n}`, leaving the skeleton
+        // `σaτ` (4 product states).
+        if key == left_root || key == right_root {
+            continue;
+        }
+        if map.order.len() >= max_abstractions {
+            break;
+        }
         let ch = char::from_u32(next_fresh).unwrap_or('\u{E000}');
         next_fresh = next_fresh.saturating_add(1);
         map.entries.insert(ch, (expr, score));
@@ -373,12 +390,67 @@ fn abstract_verdict(query: Query, result: &BackendResult) -> Option<bool> {
 /// consume up to `(MAX_REFINEMENT_ROUNDS + 1) x timeout_ms` wall-clock time
 /// before ever reporting `UNKNOWN`, silently blowing past the budget the
 /// caller configured.
-fn budget_config(config: &Config, started: Instant) -> Config {
+///
+/// Returns `None` once `config.timeout_ms` has already been exhausted by
+/// prior rounds -- every call site must treat that as "stop now, return a
+/// Timeout result" rather than launching more work with whatever budget
+/// this returns. Previously this clamped the remaining budget to a minimum
+/// of 1ms instead of ever returning `None`, so a round was *always*
+/// launched no matter how far past the deadline the call already was -- and
+/// each of those rounds could itself take meaningfully longer than 1ms to
+/// notice its budget was gone, letting a hard instance blow well past
+/// `timeout_ms` in aggregate even though every individual round *looked*
+/// budget-respecting.
+fn budget_config(config: &Config, started: Instant) -> Option<Config> {
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let remaining = config.timeout_ms.saturating_sub(elapsed_ms).max(1);
+    if elapsed_ms >= config.timeout_ms {
+        return None;
+    }
     let mut cfg = config.clone();
-    cfg.timeout_ms = remaining;
-    cfg
+    cfg.timeout_ms = config.timeout_ms - elapsed_ms;
+    Some(cfg)
+}
+
+/// A `BackendResult` reporting that the shared timeout budget was already
+/// exhausted before this step could run -- for every `budget_config` call
+/// site to return uniformly instead of launching more work.
+fn timeout_result(started: Instant) -> BackendResult {
+    BackendResult {
+        status: BackendStatus::Timeout,
+        witness: None,
+        relation: None,
+        visited_states: 0,
+        generated_transitions: 0,
+        analysis_ms: started.elapsed().as_millis(),
+        witness_extraction_ms: 0,
+    }
+}
+
+/// Falls back to running `inner` concretely on the *original* (unabstracted)
+/// patterns, or a Timeout result if the shared budget is already exhausted
+/// rather than launching that work. Shared by every "give up on abstraction,
+/// run the real patterns" exit in `analyze_binary_expr`.
+fn concrete_fallback<B: RelationBackend>(
+    inner: &B,
+    query: Query,
+    left_expr: &Expr,
+    right_expr: &Expr,
+    config: &Config,
+    started: Instant,
+) -> BackendResult {
+    let Some(round_config) = budget_config(config, started) else {
+        return timeout_result(started);
+    };
+    let left_nfa = Nfa::from_expr(left_expr);
+    let right_nfa = Nfa::from_expr(right_expr);
+    inner.analyze_binary_expr(
+        query,
+        left_expr,
+        right_expr,
+        &left_nfa,
+        &right_nfa,
+        &round_config,
+    )
 }
 
 /// CEGAR driver that owns the abstraction map and delegates to an inner backend.
@@ -468,32 +540,14 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
             // unsound abstract YES; this is the same fallback path used
             // below when there's nothing to abstract or refinement is
             // exhausted.
-            let left_nfa = Nfa::from_expr(left_expr);
-            let right_nfa = Nfa::from_expr(right_expr);
-            return self.inner.analyze_binary_expr(
-                query,
-                left_expr,
-                right_expr,
-                &left_nfa,
-                &right_nfa,
-                &budget_config(config, started),
-            );
+            return concrete_fallback(&self.inner, query, left_expr, right_expr, config, started);
         }
 
         let mut map = build_initial_map(left_expr, right_expr, self.max_abstractions);
 
         if map.is_empty() {
             // Nothing useful to abstract → concrete analysis.
-            let left_nfa = Nfa::from_expr(left_expr);
-            let right_nfa = Nfa::from_expr(right_expr);
-            return self.inner.analyze_binary_expr(
-                query,
-                left_expr,
-                right_expr,
-                &left_nfa,
-                &right_nfa,
-                &budget_config(config, started),
-            );
+            return concrete_fallback(&self.inner, query, left_expr, right_expr, config, started);
         }
 
         // `build_initial_map` discovers common subexpressions from the
@@ -512,10 +566,12 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
 
         let mut rounds = 0;
         loop {
+            let Some(round_config) = budget_config(config, started) else {
+                return timeout_result(started);
+            };
             let (abs_left, abs_right) = abstract_pair(&left_n, &right_n, &map);
             let left_nfa = Nfa::from_expr(&abs_left);
             let right_nfa = Nfa::from_expr(&abs_right);
-            let round_config = budget_config(config, started);
 
             let result = self.inner.analyze_binary_expr(
                 query,
@@ -537,7 +593,10 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
             let mut expanded_witness: Option<String> = None;
             if verdict == Some(true) {
                 if let Some(w) = &result.witness {
-                    match expand_witness(w, &map, &budget_config(config, started)) {
+                    let Some(expand_config) = budget_config(config, started) else {
+                        return timeout_result(started);
+                    };
+                    match expand_witness(w, &map, &expand_config) {
                         Some(concrete) => expanded_witness = Some(concrete),
                         None => verdict = None,
                     }
@@ -564,15 +623,13 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
                     rounds += 1;
                     if rounds > MAX_REFINEMENT_ROUNDS || map.is_empty() {
                         // Fall back to concrete analysis.
-                        let left_nfa = Nfa::from_expr(left_expr);
-                        let right_nfa = Nfa::from_expr(right_expr);
-                        return self.inner.analyze_binary_expr(
+                        return concrete_fallback(
+                            &self.inner,
                             query,
                             left_expr,
                             right_expr,
-                            &left_nfa,
-                            &right_nfa,
-                            &budget_config(config, started),
+                            config,
+                            started,
                         );
                     }
 
@@ -586,15 +643,13 @@ impl<B: RelationBackend> RelationBackend for AbstractionBackend<B> {
                         // No useful witness info → expand largest remaining site.
                         if !map.expand_largest() {
                             // Nothing left to expand.
-                            let left_nfa = Nfa::from_expr(left_expr);
-                            let right_nfa = Nfa::from_expr(right_expr);
-                            return self.inner.analyze_binary_expr(
+                            return concrete_fallback(
+                                &self.inner,
                                 query,
                                 left_expr,
                                 right_expr,
-                                &left_nfa,
-                                &right_nfa,
-                                &budget_config(config, started),
+                                config,
+                                started,
                             );
                         }
                     }
@@ -618,6 +673,7 @@ mod tests {
     use crate::config::Config;
     use crate::parser::parse;
     use crate::report::Verdict;
+    use std::time::Duration;
 
     #[test]
     fn ascii_alphabet_leaves_room_for_markers_unicode_does_not() {
@@ -794,6 +850,59 @@ mod tests {
         assert!(!map.is_empty(), "expected to abstract the shared (ab)*");
     }
 
+    /// Roots of either pattern must not enter the abstraction map. Replacing
+    /// an identical pair with one marker makes abstract YES free, but then
+    /// `expand_witness` solves the original language — Θ(2ⁿ) for the
+    /// nth-from-end family — and burns the shared timeout.
+    #[test]
+    fn does_not_abstract_either_pattern_root() {
+        let cfg = Config::default();
+        let expr = parse("(a|b)*a(a|b){8}", &cfg).unwrap();
+        let map = build_initial_map(&expr, &expr, 8);
+        let root = structural_key(&normalize(&expr));
+        assert!(
+            !map.is_empty(),
+            "proper shared subexpressions such as (a|b){{8}} must still be abstracted"
+        );
+        for (sub, _) in map.entries.values() {
+            assert_ne!(
+                structural_key(sub),
+                root,
+                "the entire pattern must not be a map entry"
+            );
+        }
+    }
+
+    /// `hard_cegar_overlap__nth26-self`: identical `(a|b)*a(a|b){26}` under
+    /// the abstraction+derivatives driver, 1s budget, huge state cap. Used
+    /// to return UNKNOWN (product=0) because round 1 abstracted the root
+    /// and witness expansion exhausted the deadline. Must be a cheap YES
+    /// with a tiny abstract product (skeleton `σaτ`).
+    #[test]
+    fn identical_nth_from_end_overlap_stays_within_budget() {
+        let cfg = Config {
+            max_product_states: 60_000_000,
+            timeout_ms: 1_000,
+            ..Config::default()
+        };
+        let backend = AbstractionBackend::with_inner(crate::derivative::DerivativeBackend);
+        let pat = "(a|b)*a(a|b){26}";
+        let report = analyze_binary_with_backend(Query::Overlap, pat, pat, &cfg, &backend).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert!(
+            report.statistics.visited_product_states < 10,
+            "expected a tiny abstract product after skipping the root, got {}",
+            report.statistics.visited_product_states
+        );
+        let witness = report
+            .witness
+            .as_ref()
+            .expect("overlap YES must carry a witness")
+            .value
+            .clone();
+        assert_eq!(witness, "a".repeat(27));
+    }
+
     #[test]
     fn sound_yes_equivalence() {
         let cfg = Config::default();
@@ -880,13 +989,45 @@ mod tests {
         )
         .unwrap();
         let elapsed = started.elapsed().as_millis();
-        // Generous slack over the 50ms budget for process/allocation
-        // overhead, but nowhere near the ~250ms that 5 unshared rounds
-        // would allow.
+        // Tight slack over the 50ms budget: process/allocation overhead and
+        // one round's worth of internal timeout-check granularity, but
+        // nowhere near the ~250ms that 5 unshared rounds would allow, and
+        // nowhere near the old `.max(1)`-clamped behavior that always
+        // launched one more round no matter how far past the deadline the
+        // call already was.
         assert!(
-            elapsed < 400,
+            elapsed < 150,
             "analysis took {elapsed}ms, budget was {}ms across all rounds",
             cfg.timeout_ms
+        );
+    }
+
+    /// Regression test, the specific mechanism: `budget_config` used to
+    /// clamp the remaining budget to a minimum of 1ms (`.max(1)`) rather
+    /// than ever reporting exhaustion, so a call starting *after* its
+    /// deadline had already passed still got a nonzero budget and another
+    /// round of work was launched regardless. It must instead report `None`
+    /// -- deterministically, without any wall-clock race -- once `started`
+    /// is far enough in the past that `config.timeout_ms` has elapsed.
+    #[test]
+    fn budget_config_reports_exhaustion_instead_of_a_minimum_budget() {
+        let cfg = Config {
+            timeout_ms: 50,
+            ..Config::default()
+        };
+        let long_since_started = Instant::now() - Duration::from_millis(200);
+        assert!(budget_config(&cfg, long_since_started).is_none());
+
+        // Sanity check alongside: a call that's genuinely still within
+        // budget must still get a (correspondingly reduced) config, not
+        // `None` -- the fix only changes what happens *after* the deadline.
+        let recently_started = Instant::now() - Duration::from_millis(10);
+        let remaining = budget_config(&cfg, recently_started)
+            .expect("a call still within its budget must get a config, not None");
+        assert!(
+            remaining.timeout_ms > 0 && remaining.timeout_ms <= 40,
+            "expected roughly 40ms remaining of the 50ms budget after a 10ms head start, got {}",
+            remaining.timeout_ms
         );
     }
 

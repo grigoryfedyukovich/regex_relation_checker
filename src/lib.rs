@@ -17,6 +17,7 @@ pub mod minimize;
 pub mod nfa;
 pub mod parser;
 pub mod report;
+mod residual;
 
 pub use abstraction::AbstractionBackend;
 pub use analysis::{

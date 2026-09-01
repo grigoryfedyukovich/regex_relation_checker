@@ -1,3 +1,4 @@
+use crate::charset::representative_chars;
 use crate::config::Config;
 use crate::nfa::Nfa;
 use crate::parser::{parse, FrontendError, FrontendErrorKind};
@@ -408,10 +409,11 @@ fn search_product(query: Query, left: &Nfa, right: &Nfa, config: &Config) -> Bac
             };
         }
 
-        let representatives = representative_chars(
-            left.outgoing_sets(&nodes[node_id].key.left),
-            right.outgoing_sets(&nodes[node_id].key.right),
-        );
+        let sets: Vec<&crate::charset::CharSet> = left
+            .outgoing_sets(&nodes[node_id].key.left)
+            .chain(right.outgoing_sets(&nodes[node_id].key.right))
+            .collect();
+        let representatives = representative_chars(&sets);
         for ch in representatives {
             // Checked per transition, not just once per popped node: a
             // single node can have a large fan-out (many representative
@@ -497,8 +499,9 @@ pub(crate) fn search_single(nfa: &Nfa, config: &Config) -> BackendResult {
             };
         }
 
-        let representatives =
-            representative_chars(nfa.outgoing_sets(&nodes[node_id].key.0), std::iter::empty());
+        let sets: Vec<&crate::charset::CharSet> =
+            nfa.outgoing_sets(&nodes[node_id].key.0).collect();
+        let representatives = representative_chars(&sets);
         for ch in representatives {
             // See the matching comment in `search_product` above: checked
             // per transition so a single high-fan-out node can't run past
@@ -556,30 +559,6 @@ fn stopped_result(
         analysis_ms: started.elapsed().as_millis(),
         witness_extraction_ms: 0,
     }
-}
-
-fn representative_chars<'a, L, R>(left_sets: L, right_sets: R) -> Vec<char>
-where
-    L: Iterator<Item = &'a crate::charset::CharSet>,
-    R: Iterator<Item = &'a crate::charset::CharSet>,
-{
-    let sets: Vec<&crate::charset::CharSet> = left_sets.chain(right_sets).collect();
-    let mut boundaries = Vec::new();
-    for set in &sets {
-        for interval in set.intervals() {
-            boundaries.push(interval.start);
-            if interval.end < 0x10ffff {
-                boundaries.push(interval.end + 1);
-            }
-        }
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .into_iter()
-        .filter_map(char::from_u32)
-        .filter(|ch| sets.iter().any(|set| set.contains(*ch)))
-        .collect()
 }
 
 fn classify_relation(

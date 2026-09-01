@@ -18,184 +18,16 @@
 //! condition and why it is sound.
 
 use crate::analysis::{BackendResult, BackendStatus, Query, RelationBackend};
-use crate::ast::{Expr, ExprKind};
-use crate::charset::CharSet;
+use crate::ast::Expr;
+use crate::charset::representative_chars;
 use crate::config::Config;
 use crate::nfa::Nfa;
 use crate::report::relation;
+use crate::residual::{dead_end_verdict, from_expr, Reg, RegKind};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Normalized residual expression. Interned via [`Rc`] so product states can
-/// share structure and cheaply clone keys for the visited set.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum RegKind {
-    /// Empty language ∅.
-    Null,
-    /// Language {ε}.
-    Eps,
-    /// Single-character language drawn from a (possibly multi-interval) set.
-    Atom(CharSet),
-    /// Ordered concatenation; never empty, never nested Concat at the top.
-    Concat(Vec<Reg>),
-    /// Sorted, duplicate-free alternation; never empty, never nested Alt.
-    Alt(Vec<Reg>),
-    /// Kleene star.
-    Star(Reg),
-}
-
-/// Computes a `RegKind`'s hash once, at construction time (see `Reg::wrap`).
-///
-/// This is the basis for hash-consing `Reg`: because `RegKind`'s derived
-/// `Hash` impl hashes its `Vec<Reg>`/`Reg` fields through *their* `Hash`
-/// impl, and `Reg::hash` (below) is overridden to just return this cached
-/// value in O(1), computing a *new* parent node's hash only means
-/// combining its immediate children's already-cached hashes -- not
-/// re-walking their entire subtrees. Without this, hashing the same large
-/// shared subterm repeatedly (e.g. as a `HashMap<(Reg, char), Reg>` key
-/// in `search_product`'s caches, or in `ResidualInterner`'s
-/// `HashMap<Reg, usize>`) costs O(size) *every single time*, hit or miss.
-fn compute_hash(kind: &RegKind) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    kind.hash(&mut hasher);
-    hasher.finish()
-}
-
-#[derive(Clone, Debug)]
-struct Reg(Rc<(RegKind, u64)>);
-
-impl std::hash::Hash for Reg {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // O(1): just the cached hash, never a tree walk. See `compute_hash`.
-        self.0.as_ref().1.hash(state);
-    }
-}
-
-impl PartialEq for Reg {
-    fn eq(&self, other: &Self) -> bool {
-        // Fast rejection on the cached hash before ever touching the
-        // (potentially large) `RegKind` comparison. The `RegKind` compare
-        // only runs when hashes already match -- true equality, or an
-        // astronomically rare 64-bit collision.
-        self.0.as_ref().1 == other.0.as_ref().1 && self.0.as_ref().0 == other.0.as_ref().0
-    }
-}
-impl Eq for Reg {}
-
 impl Reg {
-    fn kind(&self) -> &RegKind {
-        &self.0.as_ref().0
-    }
-    /// Build a `Reg` from a fresh `RegKind`, computing and caching its
-    /// hash once. Every smart constructor below goes through this instead
-    /// of `Self(Rc::new(...))` directly.
-    fn wrap(kind: RegKind) -> Self {
-        let h = compute_hash(&kind);
-        Self(Rc::new((kind, h)))
-    }
-
-    fn null() -> Self {
-        Self::wrap(RegKind::Null)
-    }
-
-    fn eps() -> Self {
-        Self::wrap(RegKind::Eps)
-    }
-
-    fn atom(set: CharSet) -> Self {
-        if set.is_empty() {
-            Self::null()
-        } else {
-            Self::wrap(RegKind::Atom(set))
-        }
-    }
-
-    fn star(inner: Reg) -> Self {
-        match inner.kind() {
-            RegKind::Null | RegKind::Eps => Self::eps(),
-            RegKind::Star(_) => inner,
-            _ => Self::wrap(RegKind::Star(inner)),
-        }
-    }
-
-    fn concat(parts: Vec<Reg>) -> Self {
-        let mut flat = Vec::new();
-        for part in parts {
-            match part.kind() {
-                RegKind::Null => return Self::null(),
-                RegKind::Eps => {}
-                RegKind::Concat(inner) => flat.extend(inner.iter().cloned()),
-                _ => flat.push(part),
-            }
-        }
-        match flat.len() {
-            0 => Self::eps(),
-            1 => flat.pop().unwrap(),
-            _ => Self::wrap(RegKind::Concat(flat)),
-        }
-    }
-
-    fn alt(parts: Vec<Reg>) -> Self {
-        let mut flat = Vec::new();
-        for part in parts {
-            match part.kind() {
-                RegKind::Null => {}
-                RegKind::Alt(inner) => flat.extend(inner.iter().cloned()),
-                _ => flat.push(part),
-            }
-        }
-        // Hash-based dedup, not sort-then-dedup: cheap now that hashing a
-        // `Reg` is O(1) (see `compute_hash`), and avoids paying for a full
-        // `O(k log k)` comparison-based sort over entries that might
-        // largely be duplicates before ever throwing most of them away.
-        // The final canonical order still needs `reg_ord`, so the
-        // (now much smaller, deduplicated) survivors get sorted after.
-        let mut seen: HashSet<Reg> = HashSet::with_capacity(flat.len());
-        for r in flat {
-            seen.insert(r);
-        }
-        let mut flat: Vec<Reg> = seen.into_iter().collect();
-        flat.sort_by(reg_ord);
-        match flat.len() {
-            0 => Self::null(),
-            1 => flat.pop().unwrap(),
-            _ => Self::wrap(RegKind::Alt(flat)),
-        }
-    }
-
-    fn nullable(&self) -> bool {
-        match self.kind() {
-            RegKind::Null | RegKind::Atom(_) => false,
-            RegKind::Eps | RegKind::Star(_) => true,
-            RegKind::Concat(parts) => parts.iter().all(Reg::nullable),
-            RegKind::Alt(parts) => parts.iter().any(Reg::nullable),
-        }
-    }
-
-    /// Collect outermost character sets that can start a non-empty word.
-    fn first_sets(&self, out: &mut Vec<CharSet>) {
-        match self.kind() {
-            RegKind::Null | RegKind::Eps => {}
-            RegKind::Atom(set) => out.push(set.clone()),
-            RegKind::Concat(parts) => {
-                for part in parts {
-                    part.first_sets(out);
-                    if !part.nullable() {
-                        break;
-                    }
-                }
-            }
-            RegKind::Alt(parts) => {
-                for part in parts {
-                    part.first_sets(out);
-                }
-            }
-            RegKind::Star(inner) => inner.first_sets(out),
-        }
-    }
-
     /// Computes ∂ᶜʰ(self), memoized in `cache`.
     ///
     /// `cache` is expected to live for the whole search -- the same map
@@ -285,142 +117,6 @@ impl Reg {
     }
 }
 
-/// Deterministic total order for alternation sorting / dedup.
-fn reg_ord(a: &Reg, b: &Reg) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    fn rank(r: &RegKind) -> u8 {
-        match r {
-            RegKind::Null => 0,
-            RegKind::Eps => 1,
-            RegKind::Atom(_) => 2,
-            RegKind::Concat(_) => 3,
-            RegKind::Alt(_) => 4,
-            RegKind::Star(_) => 5,
-        }
-    }
-    let ka = a.kind();
-    let kb = b.kind();
-    match rank(ka).cmp(&rank(kb)) {
-        Ordering::Equal => {}
-        other => return other,
-    }
-    match (ka, kb) {
-        (RegKind::Null, RegKind::Null) | (RegKind::Eps, RegKind::Eps) => Ordering::Equal,
-        (RegKind::Atom(sa), RegKind::Atom(sb)) => {
-            let ia = sa.intervals();
-            let ib = sb.intervals();
-            // Length first: sets with a different number of intervals can
-            // never be equal, so this decides most unequal pairs in O(1)
-            // instead of walking min(len) intervals first. Same rationale
-            // as the Concat/Alt cases below.
-            match ia.len().cmp(&ib.len()) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-            for (a, b) in ia.iter().zip(ib.iter()) {
-                match (a.start, a.end).cmp(&(b.start, b.end)) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-            }
-            Ordering::Equal
-        }
-        (RegKind::Concat(pa), RegKind::Concat(pb)) => {
-            // Length first, *then* elementwise -- not the reverse. Two
-            // lists of different length can never be equal, so checking
-            // length up front lets most comparisons between
-            // differently-sized terms finish in O(1) instead of walking
-            // min(len) shared elements only to fall back to the same
-            // length check anyway.
-            //
-            // This matters far more than it looks like it should: for a
-            // pattern like 500 concatenated `a?`s (no wrapping `*`), each
-            // derivative step's residual is a single `Alt` of up to ~n
-            // branches -- `Concat` chains that are literally suffixes of
-            // the same repeated element, differing *only* in length.
-            // Comparing two of them elementwise-first walks every shared
-            // element (all trivially equal) before ever reaching the part
-            // that actually distinguishes them -- turning what should be
-            // an O(1) decision into an O(n) one, repeated across every
-            // comparison in the sort. Confirmed on the analogous
-            // `AntimirovBackend` case (same shape, same cost) before
-            // porting the same fix here.
-            match pa.len().cmp(&pb.len()) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-            for (x, y) in pa.iter().zip(pb.iter()) {
-                match reg_ord(x, y) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-            }
-            Ordering::Equal
-        }
-        (RegKind::Alt(pa), RegKind::Alt(pb)) => {
-            // Same length-first rationale as the Concat case above.
-            match pa.len().cmp(&pb.len()) {
-                Ordering::Equal => {}
-                other => return other,
-            }
-            for (x, y) in pa.iter().zip(pb.iter()) {
-                match reg_ord(x, y) {
-                    Ordering::Equal => {}
-                    other => return other,
-                }
-            }
-            Ordering::Equal
-        }
-        (RegKind::Star(ia), RegKind::Star(ib)) => reg_ord(ia, ib),
-        _ => Ordering::Equal,
-    }
-}
-
-fn from_expr(expr: &Expr) -> Reg {
-    match &expr.kind {
-        ExprKind::Empty | ExprKind::AnchorStart | ExprKind::AnchorEnd => Reg::eps(),
-        ExprKind::Literal(ch) => Reg::atom(CharSet::singleton(*ch)),
-        ExprKind::CharSet(set) => Reg::atom(set.clone()),
-        ExprKind::Concat(parts) => {
-            if parts.is_empty() {
-                Reg::eps()
-            } else {
-                Reg::concat(parts.iter().map(from_expr).collect())
-            }
-        }
-        ExprKind::Alt(branches) => {
-            if branches.is_empty() {
-                Reg::null()
-            } else {
-                Reg::alt(branches.iter().map(from_expr).collect())
-            }
-        }
-        ExprKind::Repeat { expr, min, max } => expand_repeat(from_expr(expr), *min, *max),
-    }
-}
-
-/// Expand counted repetition into concat / optional / star form.
-fn expand_repeat(inner: Reg, min: usize, max: Option<usize>) -> Reg {
-    let mut parts = Vec::with_capacity(min.saturating_add(1));
-    for _ in 0..min {
-        parts.push(inner.clone());
-    }
-    match max {
-        None => {
-            parts.push(Reg::star(inner));
-            Reg::concat(parts)
-        }
-        Some(maximum) => {
-            // After the required `min` copies, each remaining slot up to
-            // `maximum` is optional: (ε | inner) chained `maximum - min` times.
-            for _ in min..maximum {
-                parts.push(Reg::alt(vec![Reg::eps(), inner.clone()]));
-            }
-            Reg::concat(parts)
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct ProductKey {
     left: Reg,
@@ -458,58 +154,16 @@ fn classify_relation(
 /// search-space pruning: it changes which states get visited, never which
 /// verdict is reachable.
 ///
-/// The condition is deliberately query-specific and asymmetric -- getting
-/// it wrong in the "more aggressive" direction produces an unsound early
-/// `Exhausted`, not just a slower search:
-///
-/// - [`Query::Overlap`] needs `left_accepts && right_accepts`
-///   simultaneously; once *either* side is `Null` that conjunction can never
-///   hold again, so pruning on either side alone is sound.
-/// - [`Query::Includes`] needs `left_accepts && !right_accepts`; once
-///   `left` is `Null`, `left_accepts` is false forever, so the conjunction
-///   can never hold regardless of what `right` does. The mirror case is
-///   *not* safe to prune: `right` going `Null` makes `!right_accepts`
-///   permanently true, which only helps satisfy the condition the next time
-///   `left` accepts, so `left`'s side must keep being explored.
-/// - [`Query::Equivalent`] fires on either `left_only` or `right_only`, so a
-///   lone dead side still leaves the other side capable of firing the
-///   opposite branch later. Pruning is only sound once *both* sides are
-///   `Null` (see `equivalent_pruning_still_finds_a_right_only_witness`
-///   below for a regression case that would fail under the too-eager
-///   "either side" rule).
+/// The actual query-specific "which combination of dead sides is safe to
+/// prune" logic lives in [`dead_end_verdict`] -- shared with
+/// `antimirov::is_dead_end`'s identical decision over its own residual
+/// representation (a `LinearForm` rather than a lone `Reg`), so the query
+/// asymmetry it documents can't drift between the two backends the way the
+/// rest of this module's residual algebra once did.
 fn is_dead_end(query: Query, left: &Reg, right: &Reg) -> bool {
     let left_dead = matches!(left.kind(), RegKind::Null);
     let right_dead = matches!(right.kind(), RegKind::Null);
-    match query {
-        Query::Overlap => left_dead || right_dead,
-        Query::Includes => left_dead,
-        Query::Equivalent => left_dead && right_dead,
-        // `is_dead_end` is only ever called from `search_product`, which
-        // only runs for the three binary queries above; `Query::Empty`
-        // takes the unary `search_single` path instead and never reaches
-        // here. `false` (never prune) is the conservative, always-safe
-        // answer for a query this function isn't actually asked about.
-        Query::Empty | Query::Match => false,
-    }
-}
-
-fn representative_chars(sets: &[CharSet]) -> Vec<char> {
-    let mut boundaries = Vec::new();
-    for set in sets {
-        for interval in set.intervals() {
-            boundaries.push(interval.start);
-            if interval.end < 0x10ffff {
-                boundaries.push(interval.end + 1);
-            }
-        }
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .into_iter()
-        .filter_map(char::from_u32)
-        .filter(|ch| sets.iter().any(|set| set.contains(*ch)))
-        .collect()
+    dead_end_verdict(query, left_dead, right_dead)
 }
 
 fn reconstruct(nodes: &[SearchNode], mut node_id: usize) -> String {
@@ -955,6 +609,8 @@ mod tests {
         analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
         AutomataBackend,
     };
+    use crate::ast::ExprKind;
+    use crate::charset::CharSet;
     use crate::report::Verdict;
     use crate::{parse, Config};
 
@@ -1010,13 +666,17 @@ mod tests {
     #[test]
     fn empty_alternation_denotes_the_empty_language() {
         // `parse` can never build `ExprKind::Alt(vec![])` (see the matching
-        // test and comment in `nfa.rs`), so this exercises `from_expr`
-        // directly against the AST node a library caller could still
-        // construct by hand. An empty alternation is the identity element
-        // for union and must normalize to `RegKind::Null` (`∅`) -- exactly
-        // what `Reg::alt` already does for an empty branch list once
-        // flattening removes everything, so `from_expr` just needs to reach
-        // that same path instead of special-casing `{ε}`.
+        // test and comment in `nfa.rs`), and external construction of
+        // `Expr`/`ExprKind` is now crate-private (`ExprKind` is also
+        // `#[non_exhaustive]`) specifically so a library caller can't hand
+        // one in either -- so this now exercises `from_expr` purely as an
+        // internal invariant check: nothing downstream should ever choke on
+        // an empty alternation if some future internal rewrite pass ever
+        // produces one. An empty alternation is the identity element for
+        // union and must normalize to `RegKind::Null` (`∅`) -- exactly what
+        // `Reg::alt` already does for an empty branch list once flattening
+        // removes everything, so `from_expr` just needs to reach that same
+        // path instead of special-casing `{ε}`.
         use crate::ast::Span;
         let expr = Expr::new(ExprKind::Alt(Vec::new()), Span::new(0, 0));
         assert_eq!(from_expr(&expr), Reg::null());

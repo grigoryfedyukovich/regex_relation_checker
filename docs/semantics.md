@@ -52,6 +52,14 @@ Classes are unions of literals and inclusive ranges. A negated class is compleme
 
 Greedy, lazy, and possessive preferences do not alter a regular language, but suffix syntax such as `*?` and `*+` is rejected as unsupported rather than silently normalized.
 
+A `{` that doesn't form one of the three forms above (`{2,1}` with the bounds
+reversed, `{abc}` with a non-numeric body, an unterminated `{2`, and so on)
+is a syntax error here, not a literal `{` -- unlike JS, Python, and the Rust
+`regex` crate, which all fall back to treating an unparseable `{...}` as a
+literal character. This is a deliberate divergence in favor of catching a
+likely typo (a malformed counted repetition) rather than silently reinterpreting
+it as a literal brace the person probably didn't intend.
+
 ## Witness ordering
 
 The search uses BFS over deterministic subset/product states. Consequently, a returned witness has minimum codepoint length. Symbolic transition intervals are partitioned at every relevant endpoint. The lowest scalar representative of each partition is explored first, making output deterministic.

@@ -40,7 +40,7 @@
 //! `Verdict::Unknown`.
 
 use crate::analysis::{BackendResult, BackendStatus, Query, RelationBackend};
-use crate::charset::{CharSet, Interval};
+use crate::charset::{alphabet_partition, representative_chars, CharSet, Interval};
 use crate::config::Config;
 use crate::nfa::Nfa;
 use crate::report::relation;
@@ -58,7 +58,6 @@ pub(crate) const DEAD: usize = 0;
 pub(crate) struct DfaState {
     pub(crate) accepting: bool,
     pub(crate) transitions: Vec<(CharSet, usize)>,
-    /// NFA state-ids in this DFA state's subset (preserved through minimize).
     pub(crate) members: Vec<usize>,
 }
 
@@ -77,72 +76,6 @@ fn lookup_transition(dfa: &Dfa, state_id: usize, ch: char) -> usize {
         .find(|(set, _)| set.contains(ch))
         .map(|(_, target)| *target)
         .unwrap_or(DEAD)
-}
-
-/// One representative character per maximal alphabet range that behaves
-/// identically (as far as membership in any of `sets` goes) across its whole
-/// span -- the same interval-boundary technique `analysis.rs`'s
-/// `representative_chars` uses, generalized from exactly two inputs to an
-/// arbitrary number, and written independently rather than shared, so a bug
-/// in one copy doesn't automatically show up in the other.
-fn representative_symbols(sets: &[&CharSet]) -> Vec<char> {
-    let mut boundaries: Vec<u32> = Vec::new();
-    for set in sets {
-        for interval in set.intervals() {
-            boundaries.push(interval.start);
-            if interval.end < 0x10ffff {
-                boundaries.push(interval.end + 1);
-            }
-        }
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .into_iter()
-        .filter_map(char::from_u32)
-        .filter(|ch| sets.iter().any(|set| set.contains(*ch)))
-        .collect()
-}
-
-/// Like `representative_symbols`, but keeps the *whole* inclusive range
-/// `(start, end, representative)` for each partition class instead of just
-/// the representative -- needed when materializing full DFA transitions
-/// rather than just picking one character to test per class.
-///
-/// Unlike `representative_symbols`, this pairs up *adjacent* boundaries via
-/// `windows(2)` to recover each range, so it needs a boundary *after* the
-/// last interval it cares about, not just at its start. `representative_symbols`
-/// (and the sibling `representative_chars` copies in `analysis.rs`,
-/// `derivative.rs`, `antimirov.rs`) only ever test boundary points for set
-/// membership directly, so an interval ending at `0x10ffff` needs no boundary
-/// past its start there -- but here, omitting it left the last boundary
-/// unpaired, silently dropping the whole top range (anything from that
-/// boundary through `0x10ffff`) from the returned partition, and so from the
-/// DFA transitions built from it. Always pushing the sentinel fixes that; the
-/// sentinel itself (`0x110000`) is one past the last valid scalar value and
-/// is only ever consumed as a window's `end`, never converted via
-/// `char::from_u32`, so it doesn't need the same validity guard `start` does.
-fn alphabet_partition(sets: &[&CharSet]) -> Vec<(u32, u32, char)> {
-    let mut boundaries: Vec<u32> = Vec::new();
-    for set in sets {
-        for interval in set.intervals() {
-            boundaries.push(interval.start);
-            boundaries.push(interval.end + 1);
-        }
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    let mut out = Vec::new();
-    for window in boundaries.windows(2) {
-        let start = window[0];
-        let end = window[1] - 1;
-        if let Some(rep) = char::from_u32(start) {
-            if sets.iter().any(|set| set.contains(rep)) {
-                out.push((start, end, rep));
-            }
-        }
-    }
-    out
 }
 
 /// Full subset construction, run to completion rather than lazily -- every
@@ -255,7 +188,7 @@ pub(crate) fn minimize(
         .iter()
         .flat_map(|s| s.transitions.iter().map(|(set, _)| set))
         .collect();
-    let reps = representative_symbols(&all_sets);
+    let reps = representative_chars(&all_sets);
 
     let n = dfa.states.len();
     let mut partition: Vec<usize> = dfa
@@ -303,15 +236,7 @@ pub(crate) fn minimize(
     }
 
     let mut new_states = Vec::with_capacity(num_classes);
-    let mut class_members: Vec<Vec<usize>> = vec![Vec::new(); num_classes];
-    for (state_id, &class) in partition.iter().enumerate() {
-        class_members[class].extend(dfa.states[state_id].members.iter().copied());
-    }
-    for members in &mut class_members {
-        members.sort_unstable();
-        members.dedup();
-    }
-    for (class, rep) in representative_of_class.iter().enumerate() {
+    for rep in &representative_of_class {
         let rep_state = rep.expect("every class has at least one member");
         let accepting = dfa.states[rep_state].accepting;
         let transitions = dfa.states[rep_state]
@@ -322,7 +247,7 @@ pub(crate) fn minimize(
         new_states.push(DfaState {
             accepting,
             transitions,
-            members: class_members[class].clone(),
+            members: dfa.states[rep_state].members.clone(),
         });
     }
 
@@ -384,7 +309,7 @@ fn dfas_isomorphic(left: &Dfa, right: &Dfa) -> bool {
         .chain(right.states.iter())
         .flat_map(|s| s.transitions.iter().map(|(set, _)| set))
         .collect();
-    let reps = representative_symbols(&all_sets);
+    let reps = representative_chars(&all_sets);
     canonical_form(left, &reps) == canonical_form(right, &reps)
 }
 
@@ -499,7 +424,7 @@ fn dfa_product_search(
             .map(|(set, _)| set)
             .collect();
         let combined: Vec<&CharSet> = l_sets.into_iter().chain(r_sets).collect();
-        for ch in representative_symbols(&combined) {
+        for ch in representative_chars(&combined) {
             // Checked per transition, not just once per popped node: a
             // single node can have a large fan-out, and that whole batch
             // would otherwise run to completion before the next chance to
@@ -603,7 +528,7 @@ fn dfa_search_single(dfa: &Dfa, config: &Config, started: Instant) -> BackendRes
             .iter()
             .map(|(set, _)| set)
             .collect();
-        for ch in representative_symbols(&sets) {
+        for ch in representative_chars(&sets) {
             // See the matching comment in `dfa_product_search` above.
             if started.elapsed() >= deadline {
                 return timed_out(
@@ -786,27 +711,9 @@ mod tests {
     }
 
     #[test]
-    fn alphabet_partition_covers_a_range_ending_at_the_last_scalar_value() {
-        // Regression guard: `alphabet_partition` used to add a boundary
-        // *after* an interval's end only when `end < 0x10ffff`, so an
-        // interval ending exactly at the top of the Unicode range got no
-        // trailing boundary. Since this function recovers ranges by pairing
-        // *adjacent* boundaries with `windows(2)`, that left the interval's
-        // own boundary unpaired -- silently dropping the whole top range
-        // from the returned partition (and so from the DFA transitions
-        // built from it), even though the interval itself was well-formed.
-        let set = CharSet::from_u32_intervals(vec![Interval::new(0x10fffe, 0x10ffff)]);
-        let partition = alphabet_partition(&[&set]);
-        assert_eq!(
-            partition,
-            vec![(0x10fffe, 0x10ffff, char::from_u32(0x10fffe).unwrap())],
-            "range ending at U+10FFFF must survive the partition, not be silently dropped"
-        );
-    }
-
-    #[test]
     fn agrees_with_automata_backend_on_unicode_boundary_ranges() {
-        // Same regression as `alphabet_partition_covers_a_range_ending_at_the_last_scalar_value`,
+        // Same regression as `alphabet_partition`'s own unit test in
+        // `charset.rs` (`alphabet_partition_covers_a_range_ending_at_the_last_scalar_value`),
         // exercised end-to-end through both backends rather than the helper
         // directly -- this is the shape of query that originally surfaced
         // the bug (a class or `.` whose compiled range runs up to U+10FFFF).
