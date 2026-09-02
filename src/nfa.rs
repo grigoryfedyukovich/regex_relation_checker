@@ -205,10 +205,16 @@ impl Builder {
 
     fn repeat(&mut self, expr: &Expr, min: usize, max: Option<usize>) -> Fragment {
         let mut result = self.empty();
+        // Track the last required copy's fragment (if any were built) so an
+        // unbounded tail (`max == None`, below) can loop directly on it
+        // instead of building yet another, otherwise-redundant copy of
+        // `expr` purely to serve as the star body.
+        let mut last_required: Option<Fragment> = None;
         for _ in 0..min {
             let copy = self.build(expr);
             self.epsilon(result.end, copy.start);
             result.end = copy.end;
+            last_required = Some(copy);
         }
 
         match max {
@@ -225,13 +231,33 @@ impl Builder {
             }
             None => {
                 let loop_end = self.state();
-                let copy = self.build(expr);
-                self.epsilon(result.end, loop_end);
-                self.epsilon(result.end, copy.start);
-                self.epsilon(copy.end, loop_end);
-                self.epsilon(copy.end, copy.start);
-                result.end = loop_end;
-                result
+                match last_required {
+                    // `a{m,}` with m >= 1: the last required copy already
+                    // sits at `result.end`/`result.start` of its own
+                    // fragment -- reuse it as the loop body directly
+                    // (Thompson's usual `a+` shape: one fragment, plus a
+                    // back-edge from its end to its own start) rather than
+                    // building an (m+1)-th copy whose only job would be to
+                    // be identical to the one already sitting right here.
+                    Some(copy) => {
+                        self.epsilon(result.end, loop_end);
+                        self.epsilon(copy.end, copy.start);
+                        result.end = loop_end;
+                        result
+                    }
+                    // `a*` (m == 0): no required copy exists to reuse, so
+                    // build the one and only copy the star needs -- already
+                    // minimal, unchanged from before.
+                    None => {
+                        let copy = self.build(expr);
+                        self.epsilon(result.end, loop_end);
+                        self.epsilon(result.end, copy.start);
+                        self.epsilon(copy.end, loop_end);
+                        self.epsilon(copy.end, copy.start);
+                        result.end = loop_end;
+                        result
+                    }
+                }
             }
         }
     }
@@ -287,17 +313,61 @@ mod tests {
     fn empty_alternation_denotes_the_empty_language() {
         // `parse` can never produce `ExprKind::Alt(vec![])` -- `parse_alt`
         // always seeds `branches` with one parsed element and unwraps to it
-        // directly instead of wrapping a lone branch in `Alt` -- so this
-        // constructs the AST node directly to cover callers who build
-        // `Expr` trees through the public AST types rather than the parser.
-        // An empty alternation is the identity element for union, so it
-        // must denote `∅` (matching nothing, not even the empty string) --
-        // see `derivative.rs`'s equivalent `empty_alternation_denotes_the_empty_language`
-        // test, which exercises the same AST node against `RegKind::Null`.
+        // directly instead of wrapping a lone branch in `Alt` -- and
+        // external construction of `Expr`/`ExprKind` is crate-private
+        // (`ExprKind` is also `#[non_exhaustive]`) specifically so a
+        // library caller can't hand one in either. So this exercises
+        // `Nfa::from_expr` purely as an internal invariant check: nothing
+        // downstream should choke on an empty alternation if some future
+        // internal rewrite pass ever produces one. An empty alternation is
+        // the identity element for union, so it must denote `∅` (matching
+        // nothing, not even the empty string) -- see `residual.rs`'s
+        // equivalent `from_expr`, which reaches the same `RegKind::Null`
+        // conclusion for the shared symbolic backends.
         let expr = Expr::new(ExprKind::Alt(Vec::new()), Span::new(0, 0));
         let nfa = Nfa::from_expr(&expr);
         assert!(!nfa.matches(""));
         assert!(!nfa.matches("a"));
+    }
+
+    /// Regression test for the Thompson construction of `a{m,}`/`a+`
+    /// (`m >= 1`, unbounded): `repeat`'s `max == None` arm used to always
+    /// build a fresh `(m+1)`-th copy of the body purely to serve as the
+    /// star tail, even though the `m`-th (last required) copy it had just
+    /// finished building was already sitting right there, unused for
+    /// anything but feeding into the next repetition. Looping directly on
+    /// that last required copy instead should build a strictly smaller
+    /// NFA -- exactly one body-sized fragment fewer -- while matching the
+    /// identical language.
+    #[test]
+    fn unbounded_repeat_with_required_minimum_reuses_the_last_copy() {
+        let nfa = compile("a{3,}");
+        // 3 required copies of 'a' (2 states each, 6 total) + the shared
+        // `self.empty()` fragment feeding the first one (2 states) + one
+        // `loop_end` state for the unbounded tail = 9. Before this fix, an
+        // extra (4th) copy of 'a' built purely for the star tail made this
+        // 11 -- the exact count is a stronger, more direct check than
+        // comparing against a different pattern's count, and pins the
+        // savings to this specific, previously-measured before/after pair
+        // rather than an indirect relationship that could hold by
+        // coincidence.
+        assert_eq!(nfa.states.len(), 9);
+
+        assert!(!nfa.matches("aa"));
+        assert!(nfa.matches("aaa"));
+        assert!(nfa.matches("aaaaaaaa"));
+    }
+
+    #[test]
+    fn unbounded_repeat_with_no_minimum_is_unaffected() {
+        // `a*` (min == 0) has no required copy to reuse, so its
+        // construction -- and state count -- must be exactly what it was
+        // before this fix: the shared `self.empty()` fragment (2 states) +
+        // one copy of the body (2 states) + `loop_end` (1 state) = 5.
+        let nfa = compile("a*");
+        assert_eq!(nfa.states.len(), 5);
+        assert!(nfa.matches(""));
+        assert!(nfa.matches("aaaaa"));
     }
 
     #[test]

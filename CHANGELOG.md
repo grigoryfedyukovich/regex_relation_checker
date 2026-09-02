@@ -15,6 +15,21 @@ All notable changes are documented here.
   abstracted; shared *proper* subexpressions still are (the skeleton `σaτ`
   for that family, 4 product states). Regression tests in `abstraction.rs`.
 
+- Improved: `Builder::repeat`'s Thompson construction for an unbounded
+  counted repetition (`a{m,}`, including `a+` as `m == 1`) built `m`
+  required copies of the body, then -- for the star tail -- built one
+  *more* copy whose only job was to serve as the loop body, discarding the
+  `m`-th (last required) copy's fragment as dead weight the moment the
+  loop was through with it. The last required copy already sits at exactly
+  the position the tail's loop body would need to be built at; looping
+  directly on it (a back-edge from its own end to its own start, the usual
+  Thompson `a+` shape) instead needs one fewer body-sized fragment, with
+  the identical language either way. `a{3,}` drops from 11 states to 9;
+  `a+` (`m == 1`) from 7 to 5. `a*` (`m == 0`, no required copy exists to
+  reuse) is unaffected -- already the minimal construction for that case.
+  Regression tests added in `nfa.rs` pinning both the new, smaller exact
+  state count and the unaffected `m == 0` case.
+
 - Added `--draw <nfa|dfa|minimized>` (and the equivalent `draw` subcommand) to
   dump a Graphviz PDF of a single regex. `nfa` uses the Thompson ε-NFA,
   `dfa` the existing subset construction in `minimize::determinize`, and
