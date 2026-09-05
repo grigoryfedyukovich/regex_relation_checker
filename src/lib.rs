@@ -7,6 +7,7 @@
 
 pub mod abstraction;
 pub mod analysis;
+pub mod antichain;
 pub mod antimirov;
 pub mod ast;
 pub mod charset;
@@ -25,6 +26,7 @@ pub use analysis::{
     analyze_match, analyze_match_with_backend, AnalyzeError, AutomataBackend, BackendResult,
     BackendStatus, Query, RelationBackend,
 };
+pub use antichain::AntichainBackend;
 pub use antimirov::AntimirovBackend;
 pub use config::{Alphabet, Config};
 pub use derivative::DerivativeBackend;

@@ -86,7 +86,7 @@ impl Nfa {
         self.is_accepting(&subset)
     }
 
-    fn epsilon_closure<I>(&self, initial: I) -> Vec<usize>
+    pub(crate) fn epsilon_closure<I>(&self, initial: I) -> Vec<usize>
     where
         I: IntoIterator<Item = usize>,
     {

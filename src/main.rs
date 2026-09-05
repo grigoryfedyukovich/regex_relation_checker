@@ -7,8 +7,8 @@ use regexrel::parser::SYNTAX_HELP;
 use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend, draw_dot,
-    render_graph, AbstractionBackend, AntimirovBackend, AutomataBackend, DerivativeBackend,
-    DrawError, DrawKind, MinimizedBackend, Query, RelationBackend,
+    render_graph, AbstractionBackend, AntichainBackend, AntimirovBackend, AutomataBackend,
+    DerivativeBackend, DrawError, DrawKind, MinimizedBackend, Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -148,6 +148,11 @@ enum BackendArg {
     /// worse than the inner alone and can do much better when the two
     /// patterns share a large block.
     Abstraction,
+    /// Antichain inclusion (De Wulf et al., CAV'06): individual NFA-A states
+    /// paired with subsets of B, pruned by subsumption. Independent engine;
+    /// designed for suffix-tracking / window languages where subset
+    /// construction is Θ(2ⁿ).
+    Antichain,
 }
 
 /// Concrete engine used inside `--backend abstraction`.
@@ -461,6 +466,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         (BackendArg::Minimized, _) => &MinimizedBackend,
         (BackendArg::Derivatives, _) => &DerivativeBackend,
         (BackendArg::Antimirov, _) => &AntimirovBackend,
+        (BackendArg::Antichain, _) => &AntichainBackend,
         (BackendArg::Abstraction, AbstractionInnerArg::Automata) => &abs_automata,
         (BackendArg::Abstraction, AbstractionInnerArg::Minimized) => &abs_minimized,
         (BackendArg::Abstraction, AbstractionInnerArg::Derivatives) => &abs_derivatives,
