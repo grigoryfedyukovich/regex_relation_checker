@@ -1646,18 +1646,19 @@ mod tests {
 
     #[test]
     fn match_agrees_across_every_backend() {
-        // `match_input` has four independent implementations (the default
-        // NFA walk `AutomataBackend`/`MinimizedBackend` share, plus
-        // `DerivativeBackend`'s and `AntimirovBackend`'s own residual
-        // walks). Nothing else in this snapshot checks them against each
-        // other, so this at least covers the cases most likely to expose a
-        // divergence: a plain match, a near-miss, the empty string, and a
-        // pattern with nontrivial nullable/star structure.
+        // `match_input` has three independent implementations (the default
+        // NFA walk `AutomataBackend`/`MinimizedBackend`/`AntichainBackend`
+        // share, plus `DerivativeBackend`'s and `AntimirovBackend`'s own
+        // residual walks). Nothing else in this snapshot checks them against
+        // each other, so this at least covers the cases most likely to
+        // expose a divergence: a plain match, a near-miss, the empty
+        // string, and a pattern with nontrivial nullable/star structure.
         let backends: &[&dyn RelationBackend] = &[
             &AutomataBackend,
             &crate::minimize::MinimizedBackend,
             &crate::derivative::DerivativeBackend,
             &crate::antimirov::AntimirovBackend,
+            &crate::antichain::AntichainBackend,
         ];
         let cases = [
             ("a+b", "aab", true),

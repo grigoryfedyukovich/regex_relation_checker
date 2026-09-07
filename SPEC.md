@@ -32,7 +32,7 @@ and configuration.
 
 ## 3. Analysis backends
 
-Five engines implement the same contract (`RelationBackend`). Select with
+Six engines implement the same contract (`RelationBackend`). Select with
 `--backend`. Completed `YES`/`NO` results must agree across backends; see
 [docs/backends.md](docs/backends.md).
 
@@ -65,22 +65,32 @@ residuals (linear form). Product BFS over pairs of linear forms; a form
 accepts when any member is nullable. Language-equivalent residual theory to
 Brzozowski with a set-shaped state key.
 
-### 3.5 `abstraction`
+### 3.5 `antichain`
+
+Antichain inclusion (De Wulf et al., CAV'06). `A` is explored as individual
+NFA states; `B` is tracked as a subset, pruned by subsumption against a
+minimal antichain of previously-seen `(state, subset)` pairs. `overlap` and
+`empty` use a plain individual-state search (no subsets on either side);
+`includes` runs the antichain search directly; `equivalent` runs both
+directional inclusions, interleaved. Independent decision procedure.
+
+### 3.6 `abstraction`
 
 Common-subexpression CEGAR reduction. Subexpressions occurring structurally
 identically in both patterns are replaced by a shared fresh marker symbol;
-`automata` runs on the reduced pair. A sound `YES` (Includes/Equivalent:
+the configured inner engine (`--abstraction-inner`, default `automata`) runs
+on the reduced pair. A sound `YES` (Includes/Equivalent:
 abstract search exhausted with no counterexample; Overlap: found match, with
 every marker in the witness expanded back to a real substring) is returned
 directly. An abstract `NO`/`UNKNOWN` triggers counterexample-guided
 refinement, bounded by `MAX_REFINEMENT_ROUNDS`, after which analysis falls
-back to `automata` on the original, unabstracted patterns. Unlike backends
-3.1–3.4, this is not an independent decision procedure — it delegates to
-`automata` — but every internal round shares one `timeout_ms` budget, and
-every Overlap witness is expanded and independently replay-validated before
-it can reach the caller (§5).
+back to the inner engine on the original, unabstracted patterns. Unlike
+backends 3.1–3.5, this is not an independent decision procedure — it
+delegates to whichever inner engine is configured — but every internal
+round shares one `timeout_ms` budget, and every Overlap witness is expanded
+and independently replay-validated before it can reach the caller (§5).
 
-### 3.6 Limits
+### 3.7 Limits
 
 `max_product_states` (`--max-states`) and `timeout_ms` (`--timeout-ms`) bound
 all backends. Exhausting either yields `UNKNOWN`.

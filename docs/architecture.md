@@ -10,11 +10,12 @@ parser (hand-written) → AST
 Thompson NFA build          ─┐
     ↓                        │  derivatives also consume AST
 RelationBackend               │  abstraction rewrites the AST, then
-  • automata  (default)      │  delegates to automata
-  • minimized                │
+  • automata  (default)      │  delegates to the configured inner engine
+  • minimized                │  (--abstraction-inner, default automata)
   • derivatives               │
   • antimirov   ←────────────┘
-  • abstraction  (wraps automata)
+  • antichain
+  • abstraction  (wraps any of the above)
     ↓
 Report (text or JSON) + optional shortest witness
 ```
@@ -32,7 +33,8 @@ Report (text or JSON) + optional shortest witness
 | `draw` | Graphviz DOT/PDF rendering of NFA, DFA, or minimized DFA (`--draw`) |
 | `derivative` | **derivatives** backend: residual algebra + residual-pair product |
 | `antimirov` | **antimirov** backend: partial derivatives (linear forms) + product |
-| `abstraction` | **abstraction** backend: common-subexpression CEGAR reduction, delegates to **automata** |
+| `antichain` | **antichain** backend: antichain inclusion (individual `A`-states × minimal-antichain `B`-subsets) |
+| `abstraction` | **abstraction** backend: common-subexpression CEGAR reduction, delegates to a configurable inner engine (`--abstraction-inner`) |
 | `config` | TOML + CLI overrides; validated limits |
 | `report` | Verdicts, witnesses, timings, JSON schema v1 |
 

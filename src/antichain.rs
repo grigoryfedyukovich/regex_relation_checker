@@ -245,9 +245,21 @@ fn post_cached(
 
 struct Node {
     qa: usize,
-    sb: BitSet,
     parent: Option<usize>,
     via: Option<char>,
+}
+
+/// Every individually-tracked `qa` live at one canonical prefix, plus that
+/// prefix's `B`-subset. `sb` is necessarily identical for every member: B's
+/// reachable subset after a given prefix depends only on the prefix, not on
+/// which `A`-state is paired with it, so it's tracked once per group rather
+/// than duplicated per member (as a flat, ungrouped frontier would). This
+/// grouping is what keeps a shortlex-ordered frontier shortlex-ordered
+/// after one more extension: members that don't share a prefix must never
+/// be interleaved as if they did (see `check_included`/`check_equivalent`).
+struct Group {
+    sb: BitSet,
+    qas: Vec<usize>,
 }
 
 fn reconstruct(arena: &[Node], mut id: usize, extra: Option<char>) -> String {
@@ -323,68 +335,87 @@ fn check_included(a: &Nfa, b: &Nfa, config: &Config) -> BackendResult {
         }
     }
 
-    let mut current: Vec<usize> = Vec::new();
-    for &qa in &eng_a.start_ids {
-        if antichain.is_subsumed(qa, &s0) {
-            continue;
+    // All start states share the empty prefix, so they form one group --
+    // see `Group`'s doc comment for why that matters.
+    let mut current: Vec<Group> = Vec::new();
+    {
+        let mut qas = Vec::new();
+        for &qa in &eng_a.start_ids {
+            if antichain.is_subsumed(qa, &s0) {
+                continue;
+            }
+            if arena.len() >= config.max_product_states {
+                return stopped(BackendStatus::StateLimit, arena.len(), generated, started);
+            }
+            antichain.insert(qa, s0.clone());
+            let id = arena.len();
+            arena.push(Node {
+                qa,
+                parent: None,
+                via: None,
+            });
+            qas.push(id);
         }
-        if arena.len() >= config.max_product_states {
-            return stopped(BackendStatus::StateLimit, arena.len(), generated, started);
+        if !qas.is_empty() {
+            current.push(Group { sb: s0, qas });
         }
-        antichain.insert(qa, s0.clone());
-        let id = arena.len();
-        arena.push(Node {
-            qa,
-            sb: s0.clone(),
-            parent: None,
-            via: None,
-        });
-        current.push(id);
     }
 
     while !current.is_empty() {
         if started.elapsed() >= deadline {
             return stopped(BackendStatus::Timeout, arena.len(), generated, started);
         }
-        let mut next: Vec<usize> = Vec::new();
-        for (p, &ch) in parts.iter().enumerate() {
+        let mut next: Vec<Group> = Vec::new();
+        for group in &current {
             if started.elapsed() >= deadline {
                 return stopped(BackendStatus::Timeout, arena.len(), generated, started);
             }
-            for &id in &current {
-                generated += 1;
-                let qa = arena[id].qa;
-                let qa_post = eng_a.delta(qa, p);
-                if qa_post.is_empty() {
-                    continue;
+            for (p, &ch) in parts.iter().enumerate() {
+                generated += group.qas.len();
+                // Shared across the whole group: B's reachable subset after
+                // this prefix+char depends only on the prefix, not on which
+                // qa we're extending.
+                let sb_post = post_cached(&eng_b, &group.sb, p, &mut cache);
+                let mut new_qas = Vec::new();
+                for &id in &group.qas {
+                    let qa = arena[id].qa;
+                    for qa2 in eng_a.delta(qa, p).iter() {
+                        if eng_a.accepts(qa2) && !eng_b.set_accepts(&sb_post) {
+                            let witness = reconstruct(&arena, id, Some(ch));
+                            return found(
+                                witness,
+                                relation::LEFT_ONLY,
+                                arena.len() + 1,
+                                generated,
+                                started,
+                            );
+                        }
+                        if antichain.is_subsumed(qa2, &sb_post) {
+                            continue;
+                        }
+                        if arena.len() >= config.max_product_states {
+                            return stopped(
+                                BackendStatus::StateLimit,
+                                arena.len(),
+                                generated,
+                                started,
+                            );
+                        }
+                        antichain.insert(qa2, sb_post.clone());
+                        let nid = arena.len();
+                        arena.push(Node {
+                            qa: qa2,
+                            parent: Some(id),
+                            via: Some(ch),
+                        });
+                        new_qas.push(nid);
+                    }
                 }
-                let sb_post = post_cached(&eng_b, &arena[id].sb, p, &mut cache);
-                for qa2 in qa_post.iter() {
-                    if eng_a.accepts(qa2) && !eng_b.set_accepts(&sb_post) {
-                        let witness = reconstruct(&arena, id, Some(ch));
-                        return found(
-                            witness,
-                            relation::LEFT_ONLY,
-                            arena.len() + 1,
-                            generated,
-                            started,
-                        );
-                    }
-                    if antichain.is_subsumed(qa2, &sb_post) {
-                        continue;
-                    }
-                    if arena.len() >= config.max_product_states {
-                        return stopped(BackendStatus::StateLimit, arena.len(), generated, started);
-                    }
-                    antichain.insert(qa2, sb_post.clone());
-                    let nid = arena.len();
-                    arena.push(Node {
-                        qa: qa2,
-                        sb: sb_post.clone(),
-                        parent: Some(id),
-                        via: Some(ch),
+                if !new_qas.is_empty() {
+                    next.push(Group {
+                        sb: sb_post,
+                        qas: new_qas,
                     });
-                    next.push(nid);
                 }
             }
         }
@@ -438,23 +469,33 @@ fn check_overlap(a: &Nfa, b: &Nfa, config: &Config) -> BackendResult {
 
     let mut arena: Vec<PairNode> = Vec::new();
     let mut seen: HashSet<(u32, u32)> = HashSet::new();
-    let mut current: Vec<usize> = Vec::new();
-    for &qa in &eng_a.start_ids {
-        for &qb in &eng_b.start_ids {
-            if !seen.insert((qa as u32, qb as u32)) {
-                continue;
+    // Every start (qa, qb) combination shares the empty prefix, so they
+    // form one group -- see `Group`'s doc comment (on the antichain-tracked
+    // struct above; the principle is the same here even though overlap
+    // tracks plain pairs, not a subset).
+    let mut current: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut ids = Vec::new();
+        for &qa in &eng_a.start_ids {
+            for &qb in &eng_b.start_ids {
+                if !seen.insert((qa as u32, qb as u32)) {
+                    continue;
+                }
+                if arena.len() >= config.max_product_states {
+                    return stopped(BackendStatus::StateLimit, arena.len(), 0, started);
+                }
+                let id = arena.len();
+                arena.push(PairNode {
+                    qa,
+                    qb,
+                    parent: None,
+                    via: None,
+                });
+                ids.push(id);
             }
-            if arena.len() >= config.max_product_states {
-                return stopped(BackendStatus::StateLimit, arena.len(), 0, started);
-            }
-            let id = arena.len();
-            arena.push(PairNode {
-                qa,
-                qb,
-                parent: None,
-                via: None,
-            });
-            current.push(id);
+        }
+        if !ids.is_empty() {
+            current.push(ids);
         }
     }
 
@@ -463,55 +504,61 @@ fn check_overlap(a: &Nfa, b: &Nfa, config: &Config) -> BackendResult {
         if started.elapsed() >= deadline {
             return stopped(BackendStatus::Timeout, arena.len(), generated, started);
         }
-        let mut next: Vec<usize> = Vec::new();
-        for (p, &ch) in parts.iter().enumerate() {
+        let mut next: Vec<Vec<usize>> = Vec::new();
+        for group in &current {
             if started.elapsed() >= deadline {
                 return stopped(BackendStatus::Timeout, arena.len(), generated, started);
             }
-            for &id in &current {
-                generated += 1;
-                let qa = arena[id].qa;
-                let qb = arena[id].qb;
-                let a_post = eng_a.delta(qa, p);
-                if a_post.is_empty() {
-                    continue;
-                }
-                let b_post = eng_b.delta(qb, p);
-                if b_post.is_empty() {
-                    continue;
-                }
-                for qa2 in a_post.iter() {
-                    for qb2 in b_post.iter() {
-                        if eng_a.accepts(qa2) && eng_b.accepts(qb2) {
-                            let witness = reconstruct_pair(&arena, id, Some(ch));
-                            return found(
-                                witness,
-                                relation::IN_BOTH,
-                                arena.len() + 1,
-                                generated,
-                                started,
-                            );
-                        }
-                        if !seen.insert((qa2 as u32, qb2 as u32)) {
-                            continue;
-                        }
-                        if arena.len() >= config.max_product_states {
-                            return stopped(
-                                BackendStatus::StateLimit,
-                                arena.len(),
-                                generated,
-                                started,
-                            );
-                        }
-                        let nid = arena.len();
-                        arena.push(PairNode {
-                            qa: qa2,
-                            qb: qb2,
-                            parent: Some(id),
-                            via: Some(ch),
-                        });
-                        next.push(nid);
+            for (p, &ch) in parts.iter().enumerate() {
+                generated += group.len();
+                let mut new_ids = Vec::new();
+                for &id in group {
+                    let qa = arena[id].qa;
+                    let qb = arena[id].qb;
+                    let a_post = eng_a.delta(qa, p);
+                    if a_post.is_empty() {
+                        continue;
                     }
+                    let b_post = eng_b.delta(qb, p);
+                    if b_post.is_empty() {
+                        continue;
+                    }
+                    for qa2 in a_post.iter() {
+                        for qb2 in b_post.iter() {
+                            if eng_a.accepts(qa2) && eng_b.accepts(qb2) {
+                                let witness = reconstruct_pair(&arena, id, Some(ch));
+                                return found(
+                                    witness,
+                                    relation::IN_BOTH,
+                                    arena.len() + 1,
+                                    generated,
+                                    started,
+                                );
+                            }
+                            if !seen.insert((qa2 as u32, qb2 as u32)) {
+                                continue;
+                            }
+                            if arena.len() >= config.max_product_states {
+                                return stopped(
+                                    BackendStatus::StateLimit,
+                                    arena.len(),
+                                    generated,
+                                    started,
+                                );
+                            }
+                            let nid = arena.len();
+                            arena.push(PairNode {
+                                qa: qa2,
+                                qb: qb2,
+                                parent: Some(id),
+                                via: Some(ch),
+                            });
+                            new_ids.push(nid);
+                        }
+                    }
+                }
+                if !new_ids.is_empty() {
+                    next.push(new_ids);
                 }
             }
         }
@@ -545,51 +592,82 @@ fn check_equivalent(a: &Nfa, b: &Nfa, config: &Config) -> BackendResult {
     let mut arena_ba: Vec<Node> = Vec::new();
     let mut generated = 0usize;
 
-    let mut current_ab: Vec<usize> = Vec::new();
-    let mut current_ba: Vec<usize> = Vec::new();
-    for &qa in &eng_a.start_ids {
-        if chain_ab.is_subsumed(qa, &eng_b.start_set) {
-            continue;
+    // All start states on each side share that side's empty prefix, so
+    // they form one group per side -- see `Group`'s doc comment.
+    let mut current_ab: Vec<Group> = Vec::new();
+    {
+        let mut qas = Vec::new();
+        for &qa in &eng_a.start_ids {
+            if chain_ab.is_subsumed(qa, &eng_b.start_set) {
+                continue;
+            }
+            if arena_ab.len() + arena_ba.len() >= config.max_product_states {
+                return stopped(
+                    BackendStatus::StateLimit,
+                    arena_ab.len() + arena_ba.len(),
+                    generated,
+                    started,
+                );
+            }
+            chain_ab.insert(qa, eng_b.start_set.clone());
+            let id = arena_ab.len();
+            arena_ab.push(Node {
+                qa,
+                parent: None,
+                via: None,
+            });
+            qas.push(id);
         }
-        if arena_ab.len() + arena_ba.len() >= config.max_product_states {
-            return stopped(
-                BackendStatus::StateLimit,
-                arena_ab.len() + arena_ba.len(),
-                generated,
-                started,
-            );
+        if !qas.is_empty() {
+            current_ab.push(Group {
+                sb: eng_b.start_set.clone(),
+                qas,
+            });
         }
-        chain_ab.insert(qa, eng_b.start_set.clone());
-        let id = arena_ab.len();
-        arena_ab.push(Node {
-            qa,
-            sb: eng_b.start_set.clone(),
-            parent: None,
-            via: None,
-        });
-        current_ab.push(id);
     }
-    for &qb in &eng_b.start_ids {
-        if chain_ba.is_subsumed(qb, &eng_a.start_set) {
-            continue;
+    let mut current_ba: Vec<Group> = Vec::new();
+    {
+        let mut qas = Vec::new();
+        for &qb in &eng_b.start_ids {
+            if chain_ba.is_subsumed(qb, &eng_a.start_set) {
+                continue;
+            }
+            if arena_ab.len() + arena_ba.len() >= config.max_product_states {
+                return stopped(
+                    BackendStatus::StateLimit,
+                    arena_ab.len() + arena_ba.len(),
+                    generated,
+                    started,
+                );
+            }
+            chain_ba.insert(qb, eng_a.start_set.clone());
+            let id = arena_ba.len();
+            arena_ba.push(Node {
+                qa: qb,
+                parent: None,
+                via: None,
+            });
+            qas.push(id);
         }
-        if arena_ab.len() + arena_ba.len() >= config.max_product_states {
-            return stopped(
-                BackendStatus::StateLimit,
-                arena_ab.len() + arena_ba.len(),
-                generated,
-                started,
-            );
+        if !qas.is_empty() {
+            current_ba.push(Group {
+                sb: eng_a.start_set.clone(),
+                qas,
+            });
         }
-        chain_ba.insert(qb, eng_a.start_set.clone());
-        let id = arena_ba.len();
-        arena_ba.push(Node {
-            qa: qb,
-            sb: eng_a.start_set.clone(),
-            parent: None,
-            via: None,
-        });
-        current_ba.push(id);
+    }
+
+    // Outcome of scanning one direction's frontier for a single BFS depth.
+    // `Hit` carries that direction's canonically-minimal counterexample for
+    // *this* depth: the group-outer/char-middle/qa-inner scan order below
+    // visits candidates in true ascending shortlex order, so the first hit
+    // found is already minimal for this direction and this depth -- no
+    // need to keep scanning once found.
+    enum DepthScan {
+        Hit(String),
+        StateLimit,
+        Timeout,
+        Continue(Vec<Group>),
     }
 
     while !current_ab.is_empty() || !current_ba.is_empty() {
@@ -601,10 +679,150 @@ fn check_equivalent(a: &Nfa, b: &Nfa, config: &Config) -> BackendResult {
                 started,
             );
         }
-        let mut next_ab: Vec<usize> = Vec::new();
-        let mut next_ba: Vec<usize> = Vec::new();
-        for (p, &ch) in parts.iter().enumerate() {
-            if started.elapsed() >= deadline {
+
+        // Scan both directions fully (each stopping at its own first hit)
+        // before deciding anything: whichever direction's minimal
+        // counterexample is lexicographically smaller is the correct
+        // overall answer for this depth, and that can't be known from
+        // only one side. A pattern can't be a counterexample from both
+        // directions at once, so `Hit`/`Hit` never share the same string.
+        let ab_outcome = 'ab: {
+            let mut next_ab: Vec<Group> = Vec::new();
+            for group in &current_ab {
+                if started.elapsed() >= deadline {
+                    break 'ab DepthScan::Timeout;
+                }
+                for (p, &ch) in parts.iter().enumerate() {
+                    generated += group.qas.len();
+                    let sb_post = post_cached(&eng_b, &group.sb, p, &mut cache_ab);
+                    let mut new_qas = Vec::new();
+                    for &id in &group.qas {
+                        let qa = arena_ab[id].qa;
+                        for qa2 in eng_a.delta(qa, p).iter() {
+                            if eng_a.accepts(qa2) && !eng_b.set_accepts(&sb_post) {
+                                break 'ab DepthScan::Hit(reconstruct(&arena_ab, id, Some(ch)));
+                            }
+                            if chain_ab.is_subsumed(qa2, &sb_post) {
+                                continue;
+                            }
+                            if arena_ab.len() + arena_ba.len() >= config.max_product_states {
+                                break 'ab DepthScan::StateLimit;
+                            }
+                            chain_ab.insert(qa2, sb_post.clone());
+                            let nid = arena_ab.len();
+                            arena_ab.push(Node {
+                                qa: qa2,
+                                parent: Some(id),
+                                via: Some(ch),
+                            });
+                            new_qas.push(nid);
+                        }
+                    }
+                    if !new_qas.is_empty() {
+                        next_ab.push(Group {
+                            sb: sb_post,
+                            qas: new_qas,
+                        });
+                    }
+                }
+            }
+            DepthScan::Continue(next_ab)
+        };
+
+        let ba_outcome = 'ba: {
+            let mut next_ba: Vec<Group> = Vec::new();
+            for group in &current_ba {
+                if started.elapsed() >= deadline {
+                    break 'ba DepthScan::Timeout;
+                }
+                for (p, &ch) in parts.iter().enumerate() {
+                    generated += group.qas.len();
+                    let sa_post = post_cached(&eng_a, &group.sb, p, &mut cache_ba);
+                    let mut new_qbs = Vec::new();
+                    for &id in &group.qas {
+                        let qb = arena_ba[id].qa;
+                        for qb2 in eng_b.delta(qb, p).iter() {
+                            if eng_b.accepts(qb2) && !eng_a.set_accepts(&sa_post) {
+                                break 'ba DepthScan::Hit(reconstruct(&arena_ba, id, Some(ch)));
+                            }
+                            if chain_ba.is_subsumed(qb2, &sa_post) {
+                                continue;
+                            }
+                            if arena_ab.len() + arena_ba.len() >= config.max_product_states {
+                                break 'ba DepthScan::StateLimit;
+                            }
+                            chain_ba.insert(qb2, sa_post.clone());
+                            let nid = arena_ba.len();
+                            arena_ba.push(Node {
+                                qa: qb2,
+                                parent: Some(id),
+                                via: Some(ch),
+                            });
+                            new_qbs.push(nid);
+                        }
+                    }
+                    if !new_qbs.is_empty() {
+                        next_ba.push(Group {
+                            sb: sa_post,
+                            qas: new_qbs,
+                        });
+                    }
+                }
+            }
+            DepthScan::Continue(next_ba)
+        };
+
+        match (ab_outcome, ba_outcome) {
+            (DepthScan::Hit(aw), DepthScan::Hit(bw)) => {
+                return if aw <= bw {
+                    found(
+                        aw,
+                        relation::LEFT_ONLY,
+                        arena_ab.len() + arena_ba.len(),
+                        generated,
+                        started,
+                    )
+                } else {
+                    found(
+                        bw,
+                        relation::RIGHT_ONLY,
+                        arena_ab.len() + arena_ba.len(),
+                        generated,
+                        started,
+                    )
+                };
+            }
+            // A sound witness on one side wins even if the other side ran
+            // out of budget scanning for a (possibly smaller) counterexample
+            // of its own -- report the answer we have rather than an
+            // UNKNOWN we don't need.
+            (DepthScan::Hit(aw), _) => {
+                return found(
+                    aw,
+                    relation::LEFT_ONLY,
+                    arena_ab.len() + arena_ba.len(),
+                    generated,
+                    started,
+                );
+            }
+            (_, DepthScan::Hit(bw)) => {
+                return found(
+                    bw,
+                    relation::RIGHT_ONLY,
+                    arena_ab.len() + arena_ba.len(),
+                    generated,
+                    started,
+                );
+            }
+            (DepthScan::StateLimit, _) | (_, DepthScan::StateLimit) => {
+                return stopped(
+                    BackendStatus::StateLimit,
+                    arena_ab.len() + arena_ba.len(),
+                    generated,
+                    started,
+                );
+            }
+            (DepthScan::Timeout, _) | (_, DepthScan::Timeout) => {
                 return stopped(
                     BackendStatus::Timeout,
                     arena_ab.len() + arena_ba.len(),
@@ -612,91 +830,11 @@ fn check_equivalent(a: &Nfa, b: &Nfa, config: &Config) -> BackendResult {
                     started,
                 );
             }
-            for &id in &current_ab {
-                generated += 1;
-                let qa = arena_ab[id].qa;
-                let qa_post = eng_a.delta(qa, p);
-                if qa_post.is_empty() {
-                    continue;
-                }
-                let sb_post = post_cached(&eng_b, &arena_ab[id].sb, p, &mut cache_ab);
-                for qa2 in qa_post.iter() {
-                    if eng_a.accepts(qa2) && !eng_b.set_accepts(&sb_post) {
-                        let witness = reconstruct(&arena_ab, id, Some(ch));
-                        return found(
-                            witness,
-                            relation::LEFT_ONLY,
-                            arena_ab.len() + arena_ba.len() + 1,
-                            generated,
-                            started,
-                        );
-                    }
-                    if chain_ab.is_subsumed(qa2, &sb_post) {
-                        continue;
-                    }
-                    if arena_ab.len() + arena_ba.len() >= config.max_product_states {
-                        return stopped(
-                            BackendStatus::StateLimit,
-                            arena_ab.len() + arena_ba.len(),
-                            generated,
-                            started,
-                        );
-                    }
-                    chain_ab.insert(qa2, sb_post.clone());
-                    let nid = arena_ab.len();
-                    arena_ab.push(Node {
-                        qa: qa2,
-                        sb: sb_post.clone(),
-                        parent: Some(id),
-                        via: Some(ch),
-                    });
-                    next_ab.push(nid);
-                }
-            }
-            for &id in &current_ba {
-                generated += 1;
-                let qb = arena_ba[id].qa;
-                let qb_post = eng_b.delta(qb, p);
-                if qb_post.is_empty() {
-                    continue;
-                }
-                let sa_post = post_cached(&eng_a, &arena_ba[id].sb, p, &mut cache_ba);
-                for qb2 in qb_post.iter() {
-                    if eng_b.accepts(qb2) && !eng_a.set_accepts(&sa_post) {
-                        let witness = reconstruct(&arena_ba, id, Some(ch));
-                        return found(
-                            witness,
-                            relation::RIGHT_ONLY,
-                            arena_ab.len() + arena_ba.len() + 1,
-                            generated,
-                            started,
-                        );
-                    }
-                    if chain_ba.is_subsumed(qb2, &sa_post) {
-                        continue;
-                    }
-                    if arena_ab.len() + arena_ba.len() >= config.max_product_states {
-                        return stopped(
-                            BackendStatus::StateLimit,
-                            arena_ab.len() + arena_ba.len(),
-                            generated,
-                            started,
-                        );
-                    }
-                    chain_ba.insert(qb2, sa_post.clone());
-                    let nid = arena_ba.len();
-                    arena_ba.push(Node {
-                        qa: qb2,
-                        sb: sa_post.clone(),
-                        parent: Some(id),
-                        via: Some(ch),
-                    });
-                    next_ba.push(nid);
-                }
+            (DepthScan::Continue(next_ab), DepthScan::Continue(next_ba)) => {
+                current_ab = next_ab;
+                current_ba = next_ba;
             }
         }
-        current_ab = next_ab;
-        current_ba = next_ba;
     }
 
     stopped(

@@ -5,7 +5,7 @@ regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
 a relation fails or overlap succeeds, it emits a **shortest** constructive
 witness.
 
-Five interchangeable analysis engines implement the same contract:
+Six interchangeable analysis engines implement the same contract:
 
 | `--backend` | Technique |
 |-------------|-----------|
@@ -13,6 +13,7 @@ Five interchangeable analysis engines implement the same contract:
 | `minimized` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | Brzozowski residuals + residual-pair product |
 | `antimirov` | Antimirov partial derivatives (linear forms) + product BFS |
+| `antichain` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
 | `abstraction` | Common-subexpression abstraction + CEGAR, wrapping any of the above |
 
 Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
@@ -79,10 +80,20 @@ Antimirov **partial** derivatives: each step yields a finite *set* of residuals
 (a linear form). Same residual language as Brzozowski, but the set form maps
 more directly to NFA states and can stay smaller under alternation.
 
+### `antichain`
+
+Antichain inclusion (De Wulf et al., CAV'06). `A` is explored as individual
+NFA states; `B` is tracked as a subset, pruned by subsumption. `overlap` and
+`empty` need no subsets at all (plain individual-state search), so unlike
+the other engines they stay cheap even on suffix-tracking languages such as
+`(a|b)*a(a|b){n}`; `includes`/`equivalent` use the antichain search itself,
+which prunes subsumed `(state, subset)` pairs to avoid the same languages'
+Θ(2ⁿ) blowup.
+
 ### `abstraction`
 
 Common-subexpression abstraction with counterexample-guided refinement
-(CEGAR), wrapping one of the four engines above rather than replacing them.
+(CEGAR), wrapping one of the five engines above rather than replacing them.
 Subexpressions shared *verbatim* by both patterns are replaced with a fresh
 marker symbol before the inner engine runs, shrinking the pattern the inner
 engine actually has to search. A resulting `YES` is validated by expanding
@@ -104,9 +115,9 @@ versus 512 product states for the same query under `automata`. See
 [bench/yes/mega_cegar_overlap__shared-core.md](bench/yes/mega_cegar_overlap__shared-core.md)
 and the sibling `mega_cegar_*` files for the measured comparison.
 
-`--abstraction-inner <automata|minimized|derivatives|antimirov>` picks which
-engine `abstraction` runs for each CEGAR round and for the concrete
-fall-back (default `automata`, matching `abstraction`'s historical
+`--abstraction-inner <automata|minimized|derivatives|antimirov|antichain>`
+picks which engine `abstraction` runs for each CEGAR round and for the
+concrete fall-back (default `automata`, matching `abstraction`'s historical
 behaviour). It's ignored by every other `--backend` value:
 
 ```bash
@@ -117,7 +128,7 @@ behaviour). It's ignored by every other `--backend` value:
 Compare engines on the same input:
 
 ```bash
-for b in automata minimized derivatives antimirov abstraction; do
+for b in automata minimized derivatives antimirov antichain abstraction; do
   echo "== $b =="
   ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
 done
@@ -276,8 +287,9 @@ assert_eq!(report.verdict, Verdict::Yes);
 ```
 
 `AbstractionBackend` is exported for programmatic use alongside the other
-four (`AutomataBackend`, `MinimizedBackend`, `DerivativeBackend`,
-`AntimirovBackend`), all implementing the shared `RelationBackend` trait:
+five (`AutomataBackend`, `MinimizedBackend`, `DerivativeBackend`,
+`AntimirovBackend`, `AntichainBackend`), all implementing the shared
+`RelationBackend` trait:
 
 ```rust
 use regexrel::{analyze_binary_with_backend, AbstractionBackend, AutomataBackend, Config, Query};

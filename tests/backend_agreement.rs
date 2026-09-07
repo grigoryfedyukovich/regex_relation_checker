@@ -1,43 +1,46 @@
 //! Differential test between the `RelationBackend` implementations.
 //!
 //! This is the concrete payoff of keeping `AutomataBackend`,
-//! `MinimizedBackend`, `DerivativeBackend`, and `AntimirovBackend` around
-//! side by side: if they ever disagree on a verdict or a witness for the
-//! same input, that's a real bug in one of them, caught automatically on
-//! every `cargo test` run rather than depending on someone noticing by
-//! hand. `AntimirovBackend` and `DerivativeBackend` share the same residual
-//! algebra (same `Reg` shape, same normalization rules) but
-//! `AntimirovBackend` decides acceptance over *sets* of residuals instead
-//! of one combined residual, so a divergence between the two specifically
-//! implicates the linear-form/set bookkeeping rather than the shared
-//! algebra.
+//! `MinimizedBackend`, `DerivativeBackend`, `AntimirovBackend`, and
+//! `AntichainBackend` around side by side: if they ever disagree on a
+//! verdict or a witness for the same input, that's a real bug in one of
+//! them, caught automatically on every `cargo test` run rather than
+//! depending on someone noticing by hand. `AntimirovBackend` and
+//! `DerivativeBackend` share the same residual algebra (same `Reg` shape,
+//! same normalization rules) but `AntimirovBackend` decides acceptance over
+//! *sets* of residuals instead of one combined residual, so a divergence
+//! between the two specifically implicates the linear-form/set bookkeeping
+//! rather than the shared algebra.
 //!
 //! This file was reconstructed after `tests/` went missing from a repo
 //! snapshot handed off mid-project; see the `match_input` coverage below in
-//! particular, which is new -- that trait method has four independent
-//! implementations (the shared NFA-walk default, plus overrides in
-//! `DerivativeBackend` and `AntimirovBackend`) and had no cross-backend
-//! check anywhere before this.
+//! particular, which is new -- that trait method has three independent
+//! implementations (the shared NFA-walk default that `AutomataBackend`,
+//! `MinimizedBackend`, and `AntichainBackend` all fall through to, plus
+//! `DerivativeBackend`'s and `AntimirovBackend`'s own residual walks) and
+//! had no cross-backend check anywhere before this.
+//!
+//! `AntichainBackend` was added to `backends()` alongside this file's
+//! original four; it was already implemented and benchmarked, but this
+//! differential loop had never been updated to exercise it (see
+//! `CHANGELOG.md`).
 
 use proptest::prelude::*;
 use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
-    AntimirovBackend, AutomataBackend, Config, DerivativeBackend, MinimizedBackend, Query,
-    RelationBackend,
+    AntichainBackend, AntimirovBackend, AutomataBackend, Config, DerivativeBackend,
+    MinimizedBackend, Query, RelationBackend,
 };
 
 const AUTOMATA: AutomataBackend = AutomataBackend;
 const MINIMIZED: MinimizedBackend = MinimizedBackend;
 const DERIVATIVES: DerivativeBackend = DerivativeBackend;
 const ANTIMIROV: AntimirovBackend = AntimirovBackend;
+const ANTICHAIN: AntichainBackend = AntichainBackend;
 
-/// Every backend under test, as trait objects, so callers can just loop
-/// instead of repeating the same four calls by hand. `const` (rather than
-/// building `&AutomataBackend` etc. inline) sidesteps any question about
-/// whether an inline unit-struct borrow gets promoted to `'static` in this
-/// position -- a `const` reference is unambiguously `'static`.
-fn backends() -> [&'static dyn RelationBackend; 4] {
-    [&AUTOMATA, &MINIMIZED, &DERIVATIVES, &ANTIMIROV]
+/// Every independent decision procedure under test.
+fn backends() -> [&'static dyn RelationBackend; 5] {
+    [&AUTOMATA, &MINIMIZED, &DERIVATIVES, &ANTIMIROV, &ANTICHAIN]
 }
 
 /// Small, bounded regex-string generator. Every leaf and every combinator

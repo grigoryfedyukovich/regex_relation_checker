@@ -2,17 +2,17 @@
 
 ## Backends
 
-All five engines (`automata`, `minimized`, `derivatives`, `antimirov`,
-`abstraction`) decide the same regular subset. They may hit
+All six engines (`automata`, `minimized`, `derivatives`, `antimirov`,
+`antichain`, `abstraction`) decide the same regular subset. They may hit
 `max_product_states` or `timeout_ms` on different inputs; a completed
 `YES`/`NO` from any backend is exact. Suffix-tracking patterns such as
 `(a|b)*a(a|b){n}` can exhaust practical limits on every current engine —
 see `bench/README.md` and `docs/backends.md`.
 
-`abstraction` is a special case: it delegates to `automata` rather than
-being a fifth independent decision procedure, so it is not currently
-exercised by the `tests/backend_agreement.rs` differential suite the other
-four are (see `docs/backends.md`). It only helps prove `YES` when the two
+`abstraction` is a special case: it delegates to a configurable inner
+engine rather than being a sixth independent decision procedure, so it is
+not currently exercised by the `tests/backend_agreement.rs` differential
+suite the other five are (see `docs/backends.md`). It only helps prove `YES` when the two
 patterns share a large subexpression verbatim; on a real `NO`, or on
 patterns with no shared structure (the nth-from-end family above, for
 instance), it falls back to `automata` with a small, bounded constant
@@ -37,7 +37,7 @@ These items affect the declared semantic boundary and should be addressed before
 3. Add randomized algebraic tests for complement and symbolic partitioning across Unicode boundary values.
 4. Define and test behavior for extremely large UTF-8 patterns and diagnostic truncation.
 5. Add a stable JSON Schema file and compatibility tests across releases.
-6. Add `AbstractionBackend` to the `tests/backend_agreement.rs` differential suite (it currently only has targeted unit tests in `abstraction.rs`, not the same randomized cross-backend fuzzing the other four engines get).
+6. Add `AbstractionBackend` to the `tests/backend_agreement.rs` differential suite (it currently only has targeted unit tests in `abstraction.rs`, not the same randomized cross-backend fuzzing the other five engines get).
 7. Make `max_product_states` cumulative across an `abstraction` query's internal rounds, the way `timeout_ms` already is, so a single query can't visit somewhat more than the configured cap in total (see `docs/backends.md`, Resource limits).
 
 ## Optional feature expansion

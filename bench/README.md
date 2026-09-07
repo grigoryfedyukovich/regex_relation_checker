@@ -43,10 +43,14 @@ Exit status: `0` all OK; `3` only LIMITs; `1` any FAIL.
 ## Hard / exponential family
 
 Patterns like `(a|b)*a(a|b){n}` (nth-from-end is `a`) have **Θ(2ⁿ)** residual/DFA
-structure. They are intentional research targets: current backends
-(`automata`, `minimized`, `derivatives`) may return `UNKNOWN` under default or
-raised limits. A `LIMIT` result is not a bad benchmark — it is a goalpost for
-new methods (suffix transducers, antichains, symbolic windows, etc.).
+structure. They are intentional research targets: `automata`, `minimized`,
+`derivatives`, and `antimirov` may return `UNKNOWN` under default or raised
+limits. `antichain`'s one-sided subset tracking narrows this substantially
+(370/392 of this suite's benchmarks resolve `OK` under `--backend antichain`,
+22 `LIMIT`, 0 `FAIL`) but doesn't eliminate it. A `LIMIT` result on the
+remainder is not a bad benchmark — it is a goalpost for further methods (a
+simulation preorder on top of antichain, suffix transducers, symbolic BDD
+windows, etc.).
 
 Also included: multi-window constraints, ternary alphabets, concatenated
 trackers, sparse double markers, wide alphabets, structural variants of the

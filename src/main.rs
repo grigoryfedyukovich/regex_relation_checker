@@ -167,6 +167,8 @@ enum AbstractionInnerArg {
     Derivatives,
     /// Antimirov partial-derivative product.
     Antimirov,
+    /// Antichain inclusion / NFA-product engine.
+    Antichain,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -460,6 +462,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
     let abs_minimized = AbstractionBackend::with_inner(MinimizedBackend);
     let abs_derivatives = AbstractionBackend::with_inner(DerivativeBackend);
     let abs_antimirov = AbstractionBackend::with_inner(AntimirovBackend);
+    let abs_antichain = AbstractionBackend::with_inner(AntichainBackend);
 
     let backend: &dyn RelationBackend = match (cli.backend, cli.abstraction_inner) {
         (BackendArg::Automata, _) => &AutomataBackend,
@@ -471,6 +474,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         (BackendArg::Abstraction, AbstractionInnerArg::Minimized) => &abs_minimized,
         (BackendArg::Abstraction, AbstractionInnerArg::Derivatives) => &abs_derivatives,
         (BackendArg::Abstraction, AbstractionInnerArg::Antimirov) => &abs_antimirov,
+        (BackendArg::Abstraction, AbstractionInnerArg::Antichain) => &abs_antichain,
     };
 
     let mut report = match command {

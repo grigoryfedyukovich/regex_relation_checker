@@ -4,6 +4,89 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Fixed: `antichain` (`src/antichain.rs`) returned a valid but
+  non-canonical witness on `includes`/`overlap`/`equivalent` — sound
+  (verdicts were never wrong) but not always the shortest-then-lowest-
+  scalar string the spec requires, so it disagreed with every other
+  backend on the exact string even when both sides agreed the pattern
+  pair was inequivalent. Caught by `cargo test` once `antichain` was
+  wired into the newly-fixed `tests/backend_agreement.rs` (previous
+  entry below) — `Equivalent("([a-c]|(a)*)", "([a-c])*")` returned `"ba"`
+  where every other backend returns `"ab"`. Root cause: all three query
+  functions built their next BFS frontier char-major
+  (`for char { for frontier_state { ... } }`), so a counterexample
+  reachable via a later character from an earlier-discovered state could
+  be returned before one reachable via an earlier character from a
+  later-discovered state, even though the latter is lexicographically
+  smaller. `check_equivalent` additionally ran its two directional
+  searches (`A⊆B`, `B⊆A`) to completion one after the other each depth,
+  so a same-depth counterexample on the side checked second could never
+  win even when it was smaller. And any NFA state with more than one
+  live successor on the same character (start-state epsilon-nondeterminism,
+  or an ordinary nondeterministic transition) split what is actually one
+  canonical prefix across multiple separately-ordered frontier slots.
+  Fixed by tracking the frontier as explicit prefix groups (`struct
+  Group`) — every individually-tracked state that shares a prefix now
+  advances through characters together, in ascending order, before any
+  other group is considered — and by having `check_equivalent` scan both
+  directions fully every depth and return whichever side's minimal
+  candidate is lexicographically smaller (falling back to whichever side
+  actually found one, if the other hit its resource budget first, rather
+  than reporting `UNKNOWN` when a correct answer is already in hand).
+  Verified against automata- and minimized-backend references across
+  ~450k differential checks (multiple seeds, depth-6 generated patterns,
+  all four query types) with zero remaining mismatches, on top of the
+  original reported case.
+
+- Added: `--abstraction-inner antichain` — the `antichain` backend
+  (`src/antichain.rs`) can now serve as the inner engine for `--backend
+  abstraction`'s CEGAR rounds and concrete fall-back, alongside the existing
+  `automata`/`minimized`/`derivatives`/`antimirov` choices. `AntichainBackend`
+  already implemented the plain, NFA-only half of `RelationBackend`
+  (`analyze_binary`/`analyze_empty`, no AST dependency) — the same shape as
+  `AutomataBackend`/`MinimizedBackend` — and `AbstractionBackend<B>` only
+  ever required `B: RelationBackend`, so this was a mechanical wiring job: a
+  new `AbstractionInnerArg::Antichain` variant, an `abs_antichain =
+  AbstractionBackend::with_inner(AntichainBackend)` binding, and the
+  corresponding match arm in `main.rs`. No change to the CEGAR
+  marker-substitution soundness argument, which is backend-agnostic by
+  construction. `README.md` and `docs/backends.md` updated to list the new
+  value.
+
+- Fixed: `tests/backend_agreement.rs` (the differential-fuzzing suite
+  actually wired into `cargo test`) still only listed four backends —
+  `automata`, `minimized`, `derivatives`, `antimirov` — and never exercised
+  `antichain` at all. An antichain-inclusive rewrite of this exact file
+  existed, but as a stray, uncompiled copy at `src/backend_agreement.rs`
+  (not declared as a `mod` anywhere, so `cargo build`/`test` silently never
+  ran it) — a leftover from whatever session added the `antichain` backend
+  and drafted the update but never moved it into `tests/`. Merged that
+  drafted version into `tests/backend_agreement.rs` (`backends()` now
+  returns all five: `automata`, `minimized`, `derivatives`, `antimirov`,
+  `antichain`) and deleted the orphaned `src/` copy. Also added
+  `AntichainBackend` to `analysis.rs`'s separate
+  `match_agrees_across_every_backend` unit test, which had the same
+  four-backend gap. `AntichainBackend` doesn't override `match_input`, so
+  it falls through to the same default NFA walk
+  `AutomataBackend`/`MinimizedBackend` already share — no surprises
+  expected here, but it was untested until now.
+
+- Documented: the `antichain` backend (`src/antichain.rs`) — antichain
+  inclusion, De Wulf et al. CAV'06 — had never been written up outside its
+  own module doc comment and `--help` text, despite being a fully
+  implemented `RelationBackend` with its own unit tests covering
+  `includes`/`overlap`/`equivalent`/`empty` and a worked window-family
+  counterexample (`(a|b)*a(a|b){8}` vs. `{7}`, shortest distinguishing
+  suffix length 9). `docs/backends.md` previously still listed "antichain
+  algorithms for inclusion" under *future* research directions even though
+  the backend had already landed. Added a `§5` section to
+  `docs/backends.md` (pipeline, strengths/weaknesses, when to use) and a
+  `§3.5` entry to `SPEC.md`; both files' backend counts corrected from five
+  to six. Also fixed the same stale count/wording in `README.md`,
+  `docs/architecture.md`, `docs/limitations.md`, and `bench/README.md`
+  (the last of which cited the actual bench numbers: 370/392 `OK`, 22
+  `LIMIT`, 0 `FAIL` under `--backend antichain`).
+
 - Fixed: CEGAR `build_initial_map` treated the entire pattern as a common
   subexpression whenever both sides shared a root (including any identical
   pair). Round 1 replaced each side with a single fresh marker, so abstract

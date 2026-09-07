@@ -1,14 +1,14 @@
 # Analysis backends
 
-`regexrel` implements five engines behind one CLI and library API. Select
-with `--backend <name>`. Four are fully independent decision procedures and
-must agree on every completed `YES` / `NO`; the fifth, `abstraction`, is a
+`regexrel` implements six engines behind one CLI and library API. Select
+with `--backend <name>`. Five are fully independent decision procedures and
+must agree on every completed `YES` / `NO`; the sixth, `abstraction`, is a
 CEGAR driver that delegates each abstract round *and* the concrete fall-back
 to a configurable inner engine (default: `automata`; override with
 `--abstraction-inner`). Its verdicts are only as independent as that
 inner's — but it carries its own soundness argument for the fast path, and
 its own witness-replay check, on top.
-Disagreement among the four independent engines is a bug; `UNKNOWN` means a
+Disagreement among the five independent engines is a bug; `UNKNOWN` means a
 resource limit was hit, not a soft “maybe”.
 
 | Flag value | Module | Core technique |
@@ -17,18 +17,19 @@ resource limit was hit, not a soft “maybe”.
 | `minimized` | `minimize.rs` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
+| `antichain` | `antichain.rs` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
 | `abstraction` | `abstraction.rs` | Common-subexpression CEGAR; inner via `--abstraction-inner` |
 
-Cross-checking the four independent engines is intentional: a defect that is
+Cross-checking the five independent engines is intentional: a defect that is
 local to one implementation is far more likely to surface as a backend
 disagreement than as a silent shared wrong answer. Integration tests in
-`tests/backend_agreement.rs` exercise this across those four backends
-(`automata`, `minimized`, `derivatives`, `antimirov`) on every `cargo test`
-run. `abstraction` is not yet in that differential-fuzzing loop (it has its
-own targeted unit tests in `abstraction.rs` instead, plus every returned
-witness is replayed against the concrete, unabstracted automata before it
-can reach the caller) — adding it to `backend_agreement.rs` is open
-follow-up work.
+`tests/backend_agreement.rs` exercise this across those five backends
+(`automata`, `minimized`, `derivatives`, `antimirov`, `antichain`) on every
+`cargo test` run. `abstraction` is not yet in that differential-fuzzing loop
+(it has its own targeted unit tests in `abstraction.rs` instead, plus every
+returned witness is replayed against the concrete, unabstracted automata
+before it can reach the caller) — adding it to `backend_agreement.rs` is
+open follow-up work.
 
 ---
 
@@ -194,7 +195,71 @@ alternation where residual *sets* stay narrow; research comparisons on the
 
 ---
 
-## 5. `abstraction` — CEGAR common-subexpression reduction
+## 5. `antichain` — antichain inclusion / NFA-state product
+
+Fifth independent engine (De Wulf et al., CAV'06). Unlike the other four,
+`A` and `B` are *not* explored symmetrically as subsets on both sides.
+
+**Pipeline**
+
+1. `empty` — [`search_single`] over `A`'s NFA states directly (same shape as
+   `automata`'s emptiness check; no antichain machinery involved).
+2. `overlap` — a plain product of *individual* NFA states of `A` and `B`
+   (no subset construction on either side) — cheapest of the four query
+   shapes, independent of the inclusion machinery below.
+3. `includes` (`check_included`) — the actual antichain search: `A` is
+   explored state-by-state (`q_A`), `B` is tracked as a subset (`S_B`,
+   packed as a `BitSet`). A pair `(q_A, S_B)` is pruned on discovery if some
+   previously-kept pair for the same `q_A` has a subset-or-equal `S_B`
+   (`Antichain::is_subsumed`) — any string the pruned pair could accept, the
+   subsuming pair accepts too, so it can never be part of a shorter or
+   otherwise-necessary counterexample. Kept pairs for a `q_A` are themselves
+   a *minimal* antichain: inserting a new `S_B` first evicts any existing
+   entry it's a subset of.
+4. `equivalent` — both directional inclusions (`A ⊆ B` and `B ⊆ A`),
+   run as two independent antichain searches sharing one state budget,
+   interleaved level-by-level so a short counterexample on either side
+   surfaces without waiting for the other to exhaust.
+
+**Strengths**
+
+- Designed for suffix-tracking / window languages such as
+  `(a|b)*a(a|b){n}` where `automata`'s symmetric subset-vs-subset product is
+  Θ(2ⁿ): tracking `B` as a subset only (not both sides) and pruning
+  subsumed pairs avoids re-deriving the same subset relationship from
+  scratch at every reachable `q_A`.
+- Independent proof technique — different state representation from all
+  four other engines — for agreement testing.
+
+**Weaknesses**
+
+- Basic antichain (this implementation) has no *simulation* preorder
+  (Abdulla et al.) on top of plain subset subsumption, so it can still
+  explore more nodes than the theoretical minimum before finding a
+  counterexample — correct, but not yet as decisive a size win as the
+  technique can be. Adding simulation is a planned follow-up (noted directly
+  in `antichain.rs`'s own test comments).
+- `overlap`'s individual-state product and `includes`/`equivalent`'s
+  antichain search count visited states differently (states×states vs.
+  states×subsets) from every other engine, so raw `--stats` counts aren't
+  directly comparable across backends the way they are among the other four
+  — compare verdicts and witnesses, not raw state counts, when
+  cross-checking.
+
+**When to use**
+
+Suffix / sliding-window properties and other inclusion checks where you
+expect `automata`'s symmetric product to blow up; cross-checking `includes`
+and `equivalent` verdicts independently of every subset-based engine.
+
+```bash
+./target/release/regexrel --backend antichain --stats includes '(a|b)*a(a|b){8}' '(a|b)*a(a|b){7}'
+./bench/run.sh --keep-going "--backend antichain --max-states 1000000 --timeout-ms 60000"
+```
+
+---
+
+## 6. `abstraction` — CEGAR common-subexpression reduction
 
 **Pipeline**
 
@@ -282,7 +347,7 @@ it anywhere in either pattern breaks the substitution `h` is supposed to be.
   gotten the full CEGAR speedup under `--alphabet ascii`. This is a real
   performance cost, not a rare corner case, for any Unicode-alphabet
   workload — the trade-off is deliberate (see `docs/limitations.md`).
-- Unlike the other four engines, it is not currently exercised by
+- Unlike the other five engines, it is not currently exercised by
   `tests/backend_agreement.rs`'s differential fuzzing (see the note in the
   overview above).
 
@@ -342,6 +407,9 @@ The inner engine is selected independently of the outer flag:
 # CEGAR over Antimirov / minimized
 ./target/release/regexrel --backend abstraction --abstraction-inner antimirov ...
 ./target/release/regexrel --backend abstraction --abstraction-inner minimized ...
+
+# CEGAR over antichain inclusion (shared block around a window/suffix property)
+./target/release/regexrel --backend abstraction --abstraction-inner antichain ...
 ```
 
 Library users construct the driver directly:
@@ -362,12 +430,12 @@ let backend = AbstractionBackend::with_inner_and_budget(DerivativeBackend, 12);
 small / unknown shape     →  automata (default)
 equivalence of "same-ish" →  minimized
 star / optional chains    →  derivatives  (and compare)
-nth-from-end / windows    →  any may UNKNOWN; needs new methods
-agreement testing         →  run all four independent engines, require identical verdicts
+nth-from-end / windows    →  try antichain first; still may UNKNOWN on very large windows
+agreement testing         →  run all five independent engines, require identical verdicts
 wide alternation residuals→  antimirov (compare to derivatives)
 large shared block        →  abstraction (inner defaults to automata;
-                             try --abstraction-inner derivatives/antimirov
-                             when the residual space of the *shrunk* pair is small)
+                             try --abstraction-inner derivatives/antimirov/antichain
+                             depending which wins on the *shrunk* pair)
 ```
 
 ```bash
@@ -398,6 +466,9 @@ return `LIMIT` (`UNKNOWN`) under practical bounds:
 - ternary and wide alphabets;
 - concatenated independent trackers.
 
-Promising directions: suffix transducers / ring-buffer abstractions, antichain
-algorithms for inclusion, symbolic (BDD) windows, and decomposition of
-regular constraints into independent projections before product.
+Promising directions: suffix transducers / ring-buffer abstractions, a
+simulation preorder (Abdulla et al.) on top of the existing `antichain`
+backend's plain subset subsumption (noted as a planned follow-up in
+`antichain.rs`'s own tests — see §5), symbolic (BDD) windows, and
+decomposition of regular constraints into independent projections before
+product.
