@@ -2,17 +2,17 @@
 
 ## Backends
 
-All six engines (`automata`, `minimized`, `derivatives`, `antimirov`,
-`antichain`, `abstraction`) decide the same regular subset. They may hit
-`max_product_states` or `timeout_ms` on different inputs; a completed
+All seven engines (`automata`, `minimized`, `derivatives`, `antimirov`,
+`antichain`, `hkc`, `abstraction`) decide the same regular subset. They may
+hit `max_product_states` or `timeout_ms` on different inputs; a completed
 `YES`/`NO` from any backend is exact. Suffix-tracking patterns such as
 `(a|b)*a(a|b){n}` can exhaust practical limits on every current engine —
 see `bench/README.md` and `docs/backends.md`.
 
 `abstraction` is a special case: it delegates to a configurable inner
-engine rather than being a sixth independent decision procedure, so it is
+engine rather than being a seventh independent decision procedure, so it is
 not currently exercised by the `tests/backend_agreement.rs` differential
-suite the other five are (see `docs/backends.md`). It only helps prove `YES` when the two
+suite the other six are (see `docs/backends.md`). It only helps prove `YES` when the two
 patterns share a large subexpression verbatim; on a real `NO`, or on
 patterns with no shared structure (the nth-from-end family above, for
 instance), it falls back to `automata` with a small, bounded constant
@@ -27,6 +27,18 @@ pattern, breaking the soundness argument the technique depends on (see
 `abstraction` gets no benefit at all, not even on patterns that share a
 large block verbatim.
 
+`hkc` is a partial case in the other direction: independent for
+`equivalent`/`includes` (its own combined-NFA bisimulation search, and
+covered by `backend_agreement.rs`), but not for `overlap` (delegates
+verbatim to `automata` — a disagreement there is definitionally
+impossible) or `empty` (shares the same NFA-reachability check `automata`
+and `antichain` already use). Its congruence-closure pruning is also the
+naive version from the paper (O(|R|) per check), not the incremental one
+(inverted index, pending-count queue) — measured against `minimized`, it
+did not show the technique's expected speedup on any pattern family tried
+so far, including a regression on this project's own suffix/window hard
+suite (see `docs/backends.md`, `hkc`, "Performance").
+
 
 ## Correctness work
 
@@ -37,8 +49,9 @@ These items affect the declared semantic boundary and should be addressed before
 3. Add randomized algebraic tests for complement and symbolic partitioning across Unicode boundary values.
 4. Define and test behavior for extremely large UTF-8 patterns and diagnostic truncation.
 5. Add a stable JSON Schema file and compatibility tests across releases.
-6. Add `AbstractionBackend` to the `tests/backend_agreement.rs` differential suite (it currently only has targeted unit tests in `abstraction.rs`, not the same randomized cross-backend fuzzing the other five engines get).
+6. Add `AbstractionBackend` to the `tests/backend_agreement.rs` differential suite (it currently only has targeted unit tests in `abstraction.rs`, not the same randomized cross-backend fuzzing the other six engines get).
 7. Make `max_product_states` cumulative across an `abstraction` query's internal rounds, the way `timeout_ms` already is, so a single query can't visit somewhat more than the configured cap in total (see `docs/backends.md`, Resource limits).
+8. Implement `hkc`'s incremental congruence-closure check (inverted index + pending-count queue, per Bonchi & Pous) in place of the current naive O(|R|)-per-check version, and re-measure against `minimized`/`antichain` on the suffix/window hard suite.
 
 ## Optional feature expansion
 
@@ -61,6 +74,6 @@ Backreferences, recursion, conditionals, arbitrary lookaround, capture histories
 
 Counted repetition is expanded structurally, so `{1000}` creates a large NFA. `max_repeat` guards this frontend cost. Product-state growth can still be exponential in the regex size; `max_product_states` and `timeout_ms` convert this into an honest `UNKNOWN`.
 
-The implementation does not enforce a hard memory limit. The documented 512 MB target should be evaluated with corpus benchmarks and process-level CI limits.
+The implementation does not enforce a hard memory limit. The documented 512 MB target should be evaluated with corpus benchmarks and process-level CI limits. `hkc`'s naive congruence-closure check is a concrete case where this matters in practice, not just in theory: on self-equivalence checks over the suffix/window family at moderate `n`, memory use grew large enough to be killed by the OS before either `max_product_states` or `timeout_ms` caught it, because per-node closure cost (and the `R` list backing it) can compound faster than the visited-state counter that those two limits watch.
 
 Dense visitation tables, binary-search charset membership, and linear charset union reduce hot-path overhead in v0.1.1. Product keys still own sorted state vectors, and symbolic representative boundaries are still recomputed per expanded BFS state. Dynamic bitsets and partition caching remain benchmark-guided optimization work.

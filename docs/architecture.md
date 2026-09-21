@@ -15,6 +15,7 @@ RelationBackend               │  abstraction rewrites the AST, then
   • derivatives               │
   • antimirov   ←────────────┘
   • antichain
+  • hkc          (overlap/empty delegate to automata / shared reachability)
   • abstraction  (wraps any of the above)
     ↓
 Report (text or JSON) + optional shortest witness
@@ -34,6 +35,7 @@ Report (text or JSON) + optional shortest witness
 | `derivative` | **derivatives** backend: residual algebra + residual-pair product |
 | `antimirov` | **antimirov** backend: partial derivatives (linear forms) + product |
 | `antichain` | **antichain** backend: antichain inclusion (individual `A`-states × minimal-antichain `B`-subsets) |
+| `hkc` | **hkc** backend: bisimulation up to congruence over a combined NFA; `overlap`/`empty` delegate rather than implementing their own search |
 | `abstraction` | **abstraction** backend: common-subexpression CEGAR reduction, delegates to a configurable inner engine (`--abstraction-inner`) |
 | `config` | TOML + CLI overrides; validated limits |
 | `report` | Verdicts, witnesses, timings, JSON schema v1 |

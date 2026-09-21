@@ -1,14 +1,14 @@
 # Analysis backends
 
-`regexrel` implements six engines behind one CLI and library API. Select
-with `--backend <name>`. Five are fully independent decision procedures and
-must agree on every completed `YES` / `NO`; the sixth, `abstraction`, is a
+`regexrel` implements seven engines behind one CLI and library API. Select
+with `--backend <name>`. Six are fully independent decision procedures and
+must agree on every completed `YES` / `NO`; the seventh, `abstraction`, is a
 CEGAR driver that delegates each abstract round *and* the concrete fall-back
 to a configurable inner engine (default: `automata`; override with
 `--abstraction-inner`). Its verdicts are only as independent as that
 inner's — but it carries its own soundness argument for the fast path, and
 its own witness-replay check, on top.
-Disagreement among the five independent engines is a bug; `UNKNOWN` means a
+Disagreement among the six independent engines is a bug; `UNKNOWN` means a
 resource limit was hit, not a soft “maybe”.
 
 | Flag value | Module | Core technique |
@@ -18,18 +18,19 @@ resource limit was hit, not a soft “maybe”.
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
 | `antichain` | `antichain.rs` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
+| `hkc` | `hkc.rs` | Bisimulation up to congruence over a combined NFA (no determinization) |
 | `abstraction` | `abstraction.rs` | Common-subexpression CEGAR; inner via `--abstraction-inner` |
 
-Cross-checking the five independent engines is intentional: a defect that is
+Cross-checking the six independent engines is intentional: a defect that is
 local to one implementation is far more likely to surface as a backend
 disagreement than as a silent shared wrong answer. Integration tests in
-`tests/backend_agreement.rs` exercise this across those five backends
-(`automata`, `minimized`, `derivatives`, `antimirov`, `antichain`) on every
-`cargo test` run. `abstraction` is not yet in that differential-fuzzing loop
-(it has its own targeted unit tests in `abstraction.rs` instead, plus every
-returned witness is replayed against the concrete, unabstracted automata
-before it can reach the caller) — adding it to `backend_agreement.rs` is
-open follow-up work.
+`tests/backend_agreement.rs` exercise this across those six backends
+(`automata`, `minimized`, `derivatives`, `antimirov`, `antichain`, `hkc`) on
+every `cargo test` run. `abstraction` is not yet in that differential-fuzzing
+loop (it has its own targeted unit tests in `abstraction.rs` instead, plus
+every returned witness is replayed against the concrete, unabstracted
+automata before it can reach the caller) — adding it to
+`backend_agreement.rs` is open follow-up work.
 
 ---
 
@@ -259,7 +260,85 @@ and `equivalent` verdicts independently of every subset-based engine.
 
 ---
 
-## 6. `abstraction` — CEGAR common-subexpression reduction
+## 6. `hkc` — bisimulation up to congruence
+
+Bonchi & Pous, POPL'13. `A` and `B` are combined into one NFA over a shared,
+disjoint state space (`A`'s own states, then `B`'s, offset); the search
+tracks a pair `(X, Y)` of subsets of that combined space (`X` always ⊆
+`A`'s states, `Y` always ⊆ `B`'s, since the two halves share no
+transitions). `L(A) = L(B)` iff the initial pair is bisimilar.
+
+**Pipeline**
+
+1. `empty` — delegated to `search_single`, the same NFA-reachability check
+   `automata` and `antichain` already share.
+2. `overlap` — delegated entirely to `automata`'s NFA×NFA product search.
+   Overlap needs no subsets on either side to begin with, so there's
+   nothing for HKC to determinize away, and this backend is *not* an
+   independent decision procedure for `overlap` as a result — a
+   disagreement with `automata` there is definitionally impossible.
+3. `equivalent` (direct) — a single BFS over `(X, Y)` pairs starting from
+   `(IA, IB)`. A pair is skipped without expanding it if it's already
+   *congruent* to the pairs found so far: provably bisimilar because it's
+   implied by a union of already-confirmed pairs (`(U, V)` and `(U', V')`
+   bisimilar implies `(U∪U', V∪V')` is too). Deciding this ("congruence
+   closure") is done by saturation: grow a copy of `X` by repeatedly
+   pulling in `V` whenever some confirmed `(U, V)` has `U` already inside
+   the growing set (and symmetrically), then compare the two saturated
+   sets for equality. This crate's version is the *naive* one — O(|R|) per
+   saturation call, called once per popped node — not the paper's
+   incremental version (inverted index + pending-count queue), which is
+   open follow-up work.
+4. `includes` — reduces to the same equivalence search: `L(left) ⊆
+   L(right)` iff `L(left) ∪ L(right) = L(right)`, checked as `(IA ∪ IB,
+   IB)` in the *same* combined space. No separate union-NFA construction
+   is needed, since `IB ⊆ IA ∪ IB` always (`post` is monotone), so the
+   only possible disagreement is "found in `IA ∪ IB`, not in `IB`" — a
+   `left_only` witness by construction.
+
+**Strengths**
+
+- Genuinely independent of every subset/antichain/residual technique the
+  other five engines use — a different state representation, for
+  differential cross-checking.
+- The congruence-closure technique is real and, per the paper, delivers
+  large wins on inputs with union-decomposable redundancy — see
+  "Performance" below for what that does and doesn't cover here.
+
+**Performance (measured, not assumed)**
+
+The literature's headline numbers are for inputs where a newly reached
+state pair is provably a union of already-confirmed ones. Measured against
+`minimized` here on generated patterns, a handful of deliberately redundant
+patterns (repeated identical alternation branches, nested redundant `?`),
+and this project's own suffix/window hard-suite family
+(`(a|b)*a(a|b){n}`), this naive implementation did not show a clear win in
+`visited_product_states` or wall time on any of them, and was consistently
+*worse* than `minimized` on the window family specifically (and worse by a
+growing margin as `n` increases — self-equivalence checks on that family
+started timing out and risked exhausting memory well before `minimized`
+did). That family needs genuinely non-redundant state tracking — one
+independent bit per recent position — which union-closure cannot collapse,
+so every `congruent` check there does real work for zero pruning payoff,
+and naive saturation's O(|R|)-per-check cost compounds as `R` grows
+regardless. Until the incremental congruence-closure index is implemented,
+treat `hkc` as a cross-check for `equivalent`/`includes`, not a faster
+default than `minimized`/`antichain`.
+
+**When to use**
+
+Cross-checking `equivalent`/`includes` verdicts with a structurally
+different technique from every other backend, particularly on patterns you
+suspect have redundant structure worth testing.
+
+```bash
+./target/release/regexrel --backend hkc --stats equivalent 'a+' 'aa*'
+./target/release/regexrel --backend hkc --stats includes '[a-c]+' '[a-c]*'
+```
+
+---
+
+## 7. `abstraction` — CEGAR common-subexpression reduction
 
 **Pipeline**
 
@@ -347,7 +426,7 @@ it anywhere in either pattern breaks the substitution `h` is supposed to be.
   gotten the full CEGAR speedup under `--alphabet ascii`. This is a real
   performance cost, not a rare corner case, for any Unicode-alphabet
   workload — the trade-off is deliberate (see `docs/limitations.md`).
-- Unlike the other five engines, it is not currently exercised by
+- Unlike the other six engines, it is not currently exercised by
   `tests/backend_agreement.rs`'s differential fuzzing (see the note in the
   overview above).
 
@@ -429,9 +508,10 @@ let backend = AbstractionBackend::with_inner_and_budget(DerivativeBackend, 12);
 ```text
 small / unknown shape     →  automata (default)
 equivalence of "same-ish" →  minimized
+equivalence, suspect redundant structure → hkc (cross-check; not a speed win — see §6)
 star / optional chains    →  derivatives  (and compare)
 nth-from-end / windows    →  try antichain first; still may UNKNOWN on very large windows
-agreement testing         →  run all five independent engines, require identical verdicts
+agreement testing         →  run all six independent engines, require identical verdicts
 wide alternation residuals→  antimirov (compare to derivatives)
 large shared block        →  abstraction (inner defaults to automata;
                              try --abstraction-inner derivatives/antimirov/antichain

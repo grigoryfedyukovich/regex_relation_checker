@@ -32,7 +32,7 @@ and configuration.
 
 ## 3. Analysis backends
 
-Six engines implement the same contract (`RelationBackend`). Select with
+Seven engines implement the same contract (`RelationBackend`). Select with
 `--backend`. Completed `YES`/`NO` results must agree across backends; see
 [docs/backends.md](docs/backends.md).
 
@@ -74,7 +74,26 @@ minimal antichain of previously-seen `(state, subset)` pairs. `overlap` and
 `includes` runs the antichain search directly; `equivalent` runs both
 directional inclusions, interleaved. Independent decision procedure.
 
-### 3.6 `abstraction`
+### 3.6 `hkc`
+
+Bisimulation up to congruence (Bonchi & Pous, POPL'13). `A` and `B` are
+combined into one NFA over a shared, disjoint state space; the search
+tracks a pair of subsets `(X ⊆ A's states, Y ⊆ B's states)`, starting from
+`(IA, IB)`, pruning a newly-reached pair without expanding it when it is
+already implied ("congruent") — provably bisimilar via a union of
+already-confirmed pairs. `equivalent` runs this directly; `includes`
+reduces to it (`(IA ∪ IB, IB)` in the same combined space, since `L(left) ⊆
+L(right)` iff `L(left) ∪ L(right) = L(right)`); `empty` delegates to the
+same NFA-reachability check `automata`/`antichain` use; `overlap` delegates
+to `automata` entirely (nothing to determinize away). Independent decision
+procedure for `equivalent`/`includes`; not independent for `overlap`
+(verbatim delegation) or `empty` (shared reachability check with two other
+backends). Ships with the paper's *naive* congruence-closure check — see
+`docs/backends.md` for measured performance characteristics, which did not
+reproduce the technique's headline speedups against `minimized` on this
+project's hard suite.
+
+### 3.7 `abstraction`
 
 Common-subexpression CEGAR reduction. Subexpressions occurring structurally
 identically in both patterns are replaced by a shared fresh marker symbol;
@@ -85,12 +104,12 @@ every marker in the witness expanded back to a real substring) is returned
 directly. An abstract `NO`/`UNKNOWN` triggers counterexample-guided
 refinement, bounded by `MAX_REFINEMENT_ROUNDS`, after which analysis falls
 back to the inner engine on the original, unabstracted patterns. Unlike
-backends 3.1–3.5, this is not an independent decision procedure — it
+backends 3.1–3.6, this is not an independent decision procedure — it
 delegates to whichever inner engine is configured — but every internal
 round shares one `timeout_ms` budget, and every Overlap witness is expanded
 and independently replay-validated before it can reach the caller (§5).
 
-### 3.7 Limits
+### 3.8 Limits
 
 `max_product_states` (`--max-states`) and `timeout_ms` (`--timeout-ms`) bound
 all backends. Exhausting either yields `UNKNOWN`.

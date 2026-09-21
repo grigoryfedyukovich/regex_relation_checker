@@ -5,7 +5,7 @@ regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
 a relation fails or overlap succeeds, it emits a **shortest** constructive
 witness.
 
-Six interchangeable analysis engines implement the same contract:
+Seven interchangeable analysis engines implement the same contract:
 
 | `--backend` | Technique |
 |-------------|-----------|
@@ -14,6 +14,7 @@ Six interchangeable analysis engines implement the same contract:
 | `derivatives` | Brzozowski residuals + residual-pair product |
 | `antimirov` | Antimirov partial derivatives (linear forms) + product BFS |
 | `antichain` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
+| `hkc` | Bisimulation up to congruence over a combined NFA (no determinization) |
 | `abstraction` | Common-subexpression abstraction + CEGAR, wrapping any of the above |
 
 Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
@@ -90,10 +91,27 @@ the other engines they stay cheap even on suffix-tracking languages such as
 which prunes subsumed `(state, subset)` pairs to avoid the same languages'
 Θ(2ⁿ) blowup.
 
+### `hkc`
+
+Bisimulation up to congruence (Bonchi & Pous, POPL'13). Checks `equivalent`
+directly over a combined `A ⊔ B` NFA without determinizing either side;
+`includes` reduces to it (`A ∪ B == B`, checked in the same combined
+space, no separate union NFA needed); `overlap` delegates to `automata`
+(nothing to determinize away there). The theory promises large wins when a
+newly reached state pair is provably a union of already-confirmed ones —
+but that only fires on inputs with that specific kind of redundancy.
+Measured against `minimized` on generated patterns, a handful of
+deliberately redundant patterns, and this project's own suffix/window hard
+suite, this naive implementation (no incremental congruence-closure index
+yet — see `docs/backends.md`) didn't show a clear win on any of them, and
+was consistently *worse* than `minimized` on the window family. Ships as a
+genuinely independent cross-check for `equivalent`/`includes`, not (yet) a
+faster default.
+
 ### `abstraction`
 
 Common-subexpression abstraction with counterexample-guided refinement
-(CEGAR), wrapping one of the five engines above rather than replacing them.
+(CEGAR), wrapping one of the six engines above rather than replacing them.
 Subexpressions shared *verbatim* by both patterns are replaced with a fresh
 marker symbol before the inner engine runs, shrinking the pattern the inner
 engine actually has to search. A resulting `YES` is validated by expanding
@@ -128,7 +146,7 @@ behaviour). It's ignored by every other `--backend` value:
 Compare engines on the same input:
 
 ```bash
-for b in automata minimized derivatives antimirov antichain abstraction; do
+for b in automata minimized derivatives antimirov antichain hkc abstraction; do
   echo "== $b =="
   ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
 done
@@ -287,9 +305,9 @@ assert_eq!(report.verdict, Verdict::Yes);
 ```
 
 `AbstractionBackend` is exported for programmatic use alongside the other
-five (`AutomataBackend`, `MinimizedBackend`, `DerivativeBackend`,
-`AntimirovBackend`, `AntichainBackend`), all implementing the shared
-`RelationBackend` trait:
+six (`AutomataBackend`, `MinimizedBackend`, `DerivativeBackend`,
+`AntimirovBackend`, `AntichainBackend`, `HkcBackend`), all implementing the
+shared `RelationBackend` trait:
 
 ```rust
 use regexrel::{analyze_binary_with_backend, AbstractionBackend, AutomataBackend, Config, Query};

@@ -8,7 +8,7 @@ use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend, draw_dot,
     render_graph, AbstractionBackend, AntichainBackend, AntimirovBackend, AutomataBackend,
-    DerivativeBackend, DrawError, DrawKind, MinimizedBackend, Query, RelationBackend,
+    DerivativeBackend, DrawError, DrawKind, HkcBackend, MinimizedBackend, Query, RelationBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -153,6 +153,13 @@ enum BackendArg {
     /// designed for suffix-tracking / window languages where subset
     /// construction is Θ(2ⁿ).
     Antichain,
+    /// Bisimulation up to congruence (Bonchi & Pous, POPL'13): decides
+    /// `equivalent` directly over a combined `A ⊔ B` NFA without
+    /// determinizing either side, pruning states already implied by unions
+    /// of previously-confirmed pairs. `includes` reduces to equivalence
+    /// (`A ∪ B == B`); `overlap` delegates to `automata` (HKC brings no
+    /// advantage there — nothing to determinize away).
+    Hkc,
 }
 
 /// Concrete engine used inside `--backend abstraction`.
@@ -169,6 +176,8 @@ enum AbstractionInnerArg {
     Antimirov,
     /// Antichain inclusion / NFA-product engine.
     Antichain,
+    /// Bisimulation up to congruence.
+    Hkc,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -463,6 +472,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
     let abs_derivatives = AbstractionBackend::with_inner(DerivativeBackend);
     let abs_antimirov = AbstractionBackend::with_inner(AntimirovBackend);
     let abs_antichain = AbstractionBackend::with_inner(AntichainBackend);
+    let abs_hkc = AbstractionBackend::with_inner(HkcBackend);
 
     let backend: &dyn RelationBackend = match (cli.backend, cli.abstraction_inner) {
         (BackendArg::Automata, _) => &AutomataBackend,
@@ -470,11 +480,13 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         (BackendArg::Derivatives, _) => &DerivativeBackend,
         (BackendArg::Antimirov, _) => &AntimirovBackend,
         (BackendArg::Antichain, _) => &AntichainBackend,
+        (BackendArg::Hkc, _) => &HkcBackend,
         (BackendArg::Abstraction, AbstractionInnerArg::Automata) => &abs_automata,
         (BackendArg::Abstraction, AbstractionInnerArg::Minimized) => &abs_minimized,
         (BackendArg::Abstraction, AbstractionInnerArg::Derivatives) => &abs_derivatives,
         (BackendArg::Abstraction, AbstractionInnerArg::Antimirov) => &abs_antimirov,
         (BackendArg::Abstraction, AbstractionInnerArg::Antichain) => &abs_antichain,
+        (BackendArg::Abstraction, AbstractionInnerArg::Hkc) => &abs_hkc,
     };
 
     let mut report = match command {

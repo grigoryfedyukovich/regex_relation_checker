@@ -4,6 +4,67 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Added: `hkc` backend (`src/hkc.rs`) — bisimulation up to congruence
+  (Bonchi & Pous, POPL'13), the seventh backend and sixth independent
+  `RelationBackend`. `equivalent` runs the technique directly over a
+  combined `A ⊔ B` NFA (disjoint address space, `A`'s states then `B`'s
+  offset) without determinizing either side; `includes` reduces to the
+  same search (`(IA ∪ IB, IB)` in that same combined space — no separate
+  union-NFA construction needed, since `IB ⊆ IA ∪ IB` always); `empty`
+  delegates to `search_single` (the same NFA-reachability check `automata`
+  and `antichain` already share); `overlap` delegates entirely to
+  `automata`'s product search (nothing to determinize away there, so
+  `hkc` is not an independent procedure for that query specifically).
+  Congruence-closure pruning is the *naive* O(|R|)-per-check version from
+  the paper's own pseudocode, not the incremental one (inverted index +
+  pending-count queue) — that's tracked as follow-up work in
+  `docs/limitations.md`. Added to `--abstraction-inner` and to
+  `tests/backend_agreement.rs`'s differential suite from the start.
+
+  Correctness: verified against `automata` and `minimized` across 280k
+  differential checks (8 seeds, depth-6 generated patterns, all four query
+  types, both binary-query and emptiness entry points) with zero
+  mismatches, plus the design's own hand-traced canonical examples
+  (`a+`/`aa*`, `a|b`/`b`) and this crate's existing window-family
+  regression shape. Performance: measured, not assumed — see `hkc.rs`'s
+  module doc and `docs/backends.md` §6. The technique's headline
+  speedups over `minimized` require inputs with union-decomposable
+  redundancy; testing against generated patterns, several deliberately
+  redundant patterns, and this project's suffix/window hard-suite family
+  did not reproduce a win on any of them, and `hkc` was consistently
+  *worse* than `minimized` on the window family specifically — worse by a
+  growing margin as `n` increases, to the point of risking OOM before
+  either `max_product_states` or `timeout_ms` caught it (see
+  `docs/limitations.md`, Performance). Shipped anyway as a genuinely
+  independent cross-check for `equivalent`/`includes` — that value doesn't
+  depend on it also being fast — with the performance ceiling documented
+  rather than implied.
+
+- Fixed: `cargo clippy --all-targets --all-features -- -D warnings` failed
+  to compile after the `hkc` addition above — caught by an actual clippy
+  run rather than by the standalone `rustc` harness this and the
+  `antichain` fix were verified with, since that harness compiled library
+  code only, never with `--test`, so `hkc.rs`'s own `#[cfg(test)] mod
+  tests` was silently never checked. Three issues: (1) `hkc.rs`'s test
+  helper declared its return type as `BackendResult` (the raw per-backend
+  struct) when `analyze_binary_with_backend` actually returns `Report`
+  (the public wrapper, with `Witness` values rather than bare `String`s)
+  — a real bug, not a lint, caught by `-D warnings` turning it from a
+  local test-only failure into a hard `cargo clippy` error; (2)
+  `antichain.rs`'s `Node.sb` field, write-only since the `Group`
+  restructuring (previous entry) moved subset-tracking to `Group.sb` and
+  never went back to remove the now-redundant per-node copy — removed
+  from `Node` and every construction site, incidentally dropping a few
+  redundant `.clone()` calls too; (3) `hkc.rs`'s `BitSet::is_empty`,
+  written but never called — removed. Re-verified by actually compiling
+  the crate as a `--test` target this time (all modules, full module
+  tree, matching `lib.rs`) rather than a plain binary: 144 tests pass,
+  including every `hkc`/`antichain` test and the cross-backend
+  `match_agrees_across_every_backend` check; the only failures are 5
+  `config::` TOML-loading tests that fail solely because the verification
+  harness stubs out the `toml` crate entirely, unrelated to any change
+  here or previously.
+
 - Fixed: `antichain` (`src/antichain.rs`) returned a valid but
   non-canonical witness on `includes`/`overlap`/`equivalent` — sound
   (verdicts were never wrong) but not always the shortest-then-lowest-
