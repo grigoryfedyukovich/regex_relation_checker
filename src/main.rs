@@ -123,8 +123,9 @@ struct Cli {
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum BackendArg {
-    /// On-the-fly subset construction with a single product-BFS over both
-    /// patterns at once. The default; well-exercised, no upfront cost.
+    /// On-the-fly subset products. Inclusion/equivalence first get a small
+    /// reverse-language probe, then fall back to the forward BFS if needed.
+    /// The default; well-exercised, no upfront determinization cost.
     #[default]
     Automata,
     /// Determinize and minimize each pattern first, then check equivalence

@@ -56,8 +56,11 @@ regexrel --draw minimized --emit-dot '[ab]+'
 
 ### `automata` (default)
 
-Thompson ε-NFAs and a single on-the-fly product BFS over subset pairs. No
-upfront determinization cost. Strong default for small and medium patterns.
+Thompson ε-NFAs with on-the-fly subset-product BFS. For `includes` and
+`equivalent`, the backend first spends a small bounded probe on the reversed
+languages; suffix-window expressions that are exponential left-to-right often
+collapse there. If the probe does not decide the query, the ordinary forward
+search gets the remaining budget. No upfront determinization cost.
 
 ### `minimized`
 

@@ -37,6 +37,31 @@ impl Nfa {
         }
     }
 
+    /// Return an NFA for the reversed language.
+    ///
+    /// Thompson NFAs in this crate have a single start and accept state, so
+    /// language reversal is just edge reversal plus swapping those two roles.
+    /// Character labels are unchanged.
+    pub fn reversed(&self) -> Self {
+        let mut states = vec![State::default(); self.states.len()];
+        for (source, state) in self.states.iter().enumerate() {
+            for &target in &state.epsilon {
+                states[target].epsilon.push(source);
+            }
+            for transition in &state.transitions {
+                states[transition.target].transitions.push(Transition {
+                    set: transition.set.clone(),
+                    target: source,
+                });
+            }
+        }
+        Self {
+            states,
+            start: self.accept,
+            accept: self.start,
+        }
+    }
+
     pub fn start_subset(&self) -> Vec<usize> {
         self.epsilon_closure([self.start])
     }

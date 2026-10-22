@@ -4,6 +4,19 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Added: automatic bounded language-reversal probing to the default `automata`
+  backend for `includes` and `equivalent`. The probe reverses NFA edges and
+  swaps start/accept states, using at most 10% of the configured state/time
+  budget (capped at 512 product states and 50 ms) before falling back to the
+  existing forward subset product with the remaining global budget. This
+  targets the suffix-window family where forward determinization tracks an
+  exponential rolling window but reversal turns it into a small prefix
+  constraint. Reverse witness extraction does **not** simply reverse the first
+  BFS witness: it retains all equal-depth predecessor edges through the first
+  accepting layer and reconstructs backward, preserving the public
+  shortest-codepoint-then-lowest-scalar order in the original language. Added
+  regressions for that lexical tie case and for the `nth28` hard-family shape.
+
 - Added: `hkc` backend (`src/hkc.rs`) — bisimulation up to congruence
   (Bonchi & Pous, POPL'13), the seventh backend and sixth independent
   `RelationBackend`. `equivalent` runs the technique directly over a

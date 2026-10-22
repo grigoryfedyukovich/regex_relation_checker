@@ -13,7 +13,7 @@ resource limit was hit, not a soft “maybe”.
 
 | Flag value | Module | Core technique |
 |------------|--------|----------------|
-| `automata` (default) | `analysis.rs` | On-the-fly NFA subset construction + product BFS |
+| `automata` (default) | `analysis.rs` | On-the-fly NFA subset product; bounded reverse-direction probe for inclusion/equivalence |
 | `minimized` | `minimize.rs` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
@@ -39,12 +39,17 @@ automata before it can reach the caller) — adding it to
 **Pipeline**
 
 1. Parse each pattern to an AST, compile to a Thompson ε-NFA.
-2. Run a single BFS over *pairs* of deterministic subsets `(L, R)`.
-3. Symbolic transitions: character-set partitions from both NFAs; explore the
-   lowest codepoint representative of each partition first (deterministic
-   shortest-witness order).
-4. Accepting product states decide the query (empty / overlap / includes /
-   equivalent) and reconstruct a witness along parent pointers.
+2. For `includes`/`equivalent`, reverse both NFAs and run a bounded product
+   probe (at most 10% of the configured time/state budget, capped at 50 ms /
+   512 states). Reversal preserves both relations and witness length.
+3. A successful reverse probe completes the entire first accepting BFS layer
+   and reconstructs from its shortest-path DAG so the returned word still
+   obeys the original shortest-then-lowest-scalar witness order. A naive
+   first-found reversed witness would only give colexicographic order.
+4. If the probe is inconclusive, run the historical forward subset-product BFS
+   with the remaining global budget. `overlap` and `empty` keep their existing
+   paths.
+5. Symbolic transitions use character-set partitions from both NFAs.
 
 **Strengths**
 
@@ -55,8 +60,11 @@ automata before it can reach the caller) — adding it to
 **Weaknesses**
 
 - Product size tracks the *subset* lattice, not the minimal DFA.
-- Suffix-tracking languages such as `(a|b)*a(a|b){n}` still explore Θ(2ⁿ)
-  structure in the worst case.
+- Direction selection is deliberately only a bounded probe, not a full
+  bidirectional scheduler. Inputs hard in both directions can still explore
+  exponential subset structure.
+- Reverse probing currently targets `includes`/`equivalent`; query-specific
+  reversal for other NFA backends remains separate work.
 
 **When to use**
 

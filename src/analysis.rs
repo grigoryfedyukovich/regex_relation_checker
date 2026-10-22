@@ -6,7 +6,7 @@ use crate::report::{
     relation, BackendInfo, Diagnostic, Report, Semantics, Statistics, Timings, Verdict, Witness,
 };
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -249,7 +249,7 @@ impl RelationBackend for AutomataBackend {
         right: &Nfa,
         config: &Config,
     ) -> BackendResult {
-        search_product(query, left, right, config)
+        search_product_auto(query, left, right, config)
     }
 
     fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult {
@@ -363,6 +363,271 @@ pub fn analyze_empty_with_backend(
         report_from_empty_outcome(&nfa, outcome, config, parse_elapsed, build_elapsed, backend);
     validate_empty_witness(&mut report, &nfa)?;
     Ok(report)
+}
+
+/// A small reverse-direction probe before the ordinary forward product walk.
+///
+/// The hard suffix-window family in the benchmark suite blows up under
+/// left-to-right determinization but collapses after language reversal.  A
+/// full "always reverse" policy would merely move that pathology to prefix-
+/// heavy inputs, so the default backend spends only a small, bounded slice of
+/// the existing budget on reversal.  If the probe proves the relation or finds
+/// a counterexample, we are done; otherwise the historical forward search gets
+/// the remaining global time/state budget.
+///
+/// Reversal is currently used for inclusion/equivalence, where the audit found
+/// the large directional gap.  Overlap keeps its existing path (and antichain
+/// mode already has a query-specific NFA-state product for it).
+fn search_product_auto(query: Query, left: &Nfa, right: &Nfa, config: &Config) -> BackendResult {
+    if !matches!(query, Query::Includes | Query::Equivalent) {
+        return search_product(query, left, right, config);
+    }
+
+    const REVERSE_PROBE_STATES: usize = 512;
+    const REVERSE_PROBE_MS: u64 = 50;
+
+    let overall_started = Instant::now();
+    let mut reverse_config = config.clone();
+    reverse_config.max_product_states = config
+        .max_product_states
+        .div_ceil(10)
+        .clamp(1, REVERSE_PROBE_STATES);
+    // Never spend more than 10% of either caller budget on direction probing,
+    // while the default limits still leave 512 states -- comfortably above
+    // the 22..210 states observed for the audit's unresolved reverse cases.
+    reverse_config.timeout_ms = config.timeout_ms.div_ceil(10).clamp(1, REVERSE_PROBE_MS);
+
+    let reverse = search_product_reversed(query, left, right, &reverse_config);
+    if matches!(
+        reverse.status,
+        BackendStatus::Found | BackendStatus::Exhausted
+    ) {
+        return reverse;
+    }
+
+    let elapsed_ms = overall_started.elapsed().as_millis();
+    if elapsed_ms >= u128::from(config.timeout_ms) {
+        return BackendResult {
+            status: BackendStatus::Timeout,
+            witness: None,
+            relation: None,
+            visited_states: reverse.visited_states,
+            generated_transitions: reverse.generated_transitions,
+            analysis_ms: elapsed_ms,
+            witness_extraction_ms: reverse.witness_extraction_ms,
+        };
+    }
+
+    let remaining_states = config
+        .max_product_states
+        .saturating_sub(reverse.visited_states);
+    if remaining_states == 0 {
+        return BackendResult {
+            status: BackendStatus::StateLimit,
+            witness: None,
+            relation: None,
+            visited_states: reverse.visited_states,
+            generated_transitions: reverse.generated_transitions,
+            analysis_ms: overall_started.elapsed().as_millis(),
+            witness_extraction_ms: reverse.witness_extraction_ms,
+        };
+    }
+
+    let mut forward_config = config.clone();
+    forward_config.max_product_states = remaining_states;
+    forward_config.timeout_ms =
+        (u128::from(config.timeout_ms) - elapsed_ms).min(u128::from(u64::MAX)) as u64;
+    forward_config.timeout_ms = forward_config.timeout_ms.max(1);
+    let mut forward = search_product(query, left, right, &forward_config);
+    forward.visited_states = forward
+        .visited_states
+        .saturating_add(reverse.visited_states);
+    forward.generated_transitions = forward
+        .generated_transitions
+        .saturating_add(reverse.generated_transitions);
+    forward.analysis_ms = overall_started.elapsed().as_millis();
+    forward.witness_extraction_ms = forward
+        .witness_extraction_ms
+        .saturating_add(reverse.witness_extraction_ms);
+    forward
+}
+
+#[derive(Clone, Debug)]
+struct ReverseSearchNode {
+    key: ProductKey,
+    depth: usize,
+    /// Every incoming edge that reaches this node at its shortest depth.
+    /// Keeping all equal-depth parents is what lets reconstruction optimize
+    /// the *reversed-back* word rather than the reverse-search word.
+    incoming: Vec<(usize, char)>,
+}
+
+/// Search the product of the reversed languages while preserving the public
+/// witness contract: shortest codepoint length, then lowest scalar value in
+/// the *original* word.
+///
+/// A first-found reverse BFS witness is insufficient: it is lexicographically
+/// minimal in reversed-word order (colexicographic in the original language).
+/// We therefore finish the entire first accepting layer, retain the shortest-
+/// path DAG, and reconstruct backwards choosing the lowest character at each
+/// original-word position.
+fn search_product_reversed(
+    query: Query,
+    left: &Nfa,
+    right: &Nfa,
+    config: &Config,
+) -> BackendResult {
+    let started = Instant::now();
+    let deadline = Duration::from_millis(config.timeout_ms);
+    let left_reversed = left.reversed();
+    let right_reversed = right.reversed();
+    let initial = ProductKey {
+        left: left_reversed.start_subset(),
+        right: right_reversed.start_subset(),
+    };
+    let mut nodes = vec![ReverseSearchNode {
+        key: initial.clone(),
+        depth: 0,
+        incoming: Vec::new(),
+    }];
+    let mut ids = HashMap::new();
+    ids.insert(initial, 0usize);
+    let mut queue = VecDeque::from([0usize]);
+    let mut generated_transitions = 0usize;
+    let mut witness_depth: Option<usize> = None;
+    let mut targets = Vec::new();
+
+    while let Some(node_id) = queue.pop_front() {
+        if started.elapsed() >= deadline {
+            return stopped_result(
+                BackendStatus::Timeout,
+                nodes.len(),
+                generated_transitions,
+                started,
+            );
+        }
+
+        let depth = nodes[node_id].depth;
+        if witness_depth.is_some_and(|d| depth > d) {
+            break;
+        }
+
+        let left_accepts = left_reversed.is_accepting(&nodes[node_id].key.left);
+        let right_accepts = right_reversed.is_accepting(&nodes[node_id].key.right);
+        if classify_relation(query, left_accepts, right_accepts).is_some() {
+            witness_depth.get_or_insert(depth);
+            targets.push(node_id);
+            // Do not expand an accepting node at the minimum depth.  All
+            // nodes already queued at this same depth are still inspected so
+            // every shortest target remains available to lexical recovery.
+            continue;
+        }
+        if witness_depth.is_some() {
+            continue;
+        }
+
+        let sets: Vec<&crate::charset::CharSet> = left_reversed
+            .outgoing_sets(&nodes[node_id].key.left)
+            .chain(right_reversed.outgoing_sets(&nodes[node_id].key.right))
+            .collect();
+        for ch in representative_chars(&sets) {
+            if started.elapsed() >= deadline {
+                return stopped_result(
+                    BackendStatus::Timeout,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
+            generated_transitions += 1;
+            let next = ProductKey {
+                left: left_reversed.step(&nodes[node_id].key.left, ch),
+                right: right_reversed.step(&nodes[node_id].key.right, ch),
+            };
+            let next_depth = depth + 1;
+            if let Some(&existing_id) = ids.get(&next) {
+                if nodes[existing_id].depth == next_depth {
+                    nodes[existing_id].incoming.push((node_id, ch));
+                }
+                continue;
+            }
+            if nodes.len() >= config.max_product_states {
+                return stopped_result(
+                    BackendStatus::StateLimit,
+                    nodes.len(),
+                    generated_transitions,
+                    started,
+                );
+            }
+            let next_id = nodes.len();
+            ids.insert(next.clone(), next_id);
+            nodes.push(ReverseSearchNode {
+                key: next,
+                depth: next_depth,
+                incoming: vec![(node_id, ch)],
+            });
+            queue.push_back(next_id);
+        }
+    }
+
+    if targets.is_empty() {
+        return stopped_result(
+            BackendStatus::Exhausted,
+            nodes.len(),
+            generated_transitions,
+            started,
+        );
+    }
+
+    let analysis_ms = started.elapsed().as_millis();
+    let witness_started = Instant::now();
+    let witness = reconstruct_reverse_shortlex(&nodes, &targets);
+    // Determine the directional relation on the original NFAs.  This also
+    // avoids having to preserve target identity through DAG reconstruction.
+    let left_accepts = left.matches(&witness);
+    let right_accepts = right.matches(&witness);
+    let relation = classify_relation(query, left_accepts, right_accepts)
+        .expect("reverse shortest-path reconstruction must yield a counterexample");
+    BackendResult {
+        status: BackendStatus::Found,
+        witness: Some(witness),
+        relation: Some(relation.to_owned()),
+        visited_states: nodes.len(),
+        generated_transitions,
+        analysis_ms,
+        witness_extraction_ms: witness_started.elapsed().as_millis(),
+    }
+}
+
+fn reconstruct_reverse_shortlex(nodes: &[ReverseSearchNode], targets: &[usize]) -> String {
+    let depth = nodes[targets[0]].depth;
+    debug_assert!(targets.iter().all(|&id| nodes[id].depth == depth));
+    if depth == 0 {
+        return String::new();
+    }
+
+    let mut viable: HashSet<usize> = targets.iter().copied().collect();
+    let mut original = String::with_capacity(depth);
+    for _ in (1..=depth).rev() {
+        let best = viable
+            .iter()
+            .flat_map(|&id| nodes[id].incoming.iter().map(|&(_, ch)| ch))
+            .min()
+            .expect("non-start shortest-path node must have an incoming edge");
+        original.push(best);
+
+        let mut predecessors = HashSet::new();
+        for &id in &viable {
+            for &(parent, ch) in &nodes[id].incoming {
+                if ch == best {
+                    predecessors.insert(parent);
+                }
+            }
+        }
+        viable = predecessors;
+    }
+    debug_assert!(viable.contains(&0));
+    original
 }
 
 fn search_product(query: Query, left: &Nfa, right: &Nfa, config: &Config) -> BackendResult {
@@ -1103,6 +1368,42 @@ mod tests {
         let report = analyze_binary(Query::Overlap, "[ba]", "[ab]", &Config::default()).unwrap();
         assert_eq!(report.verdict, Verdict::Yes);
         assert_eq!(report.witness.unwrap().value, "a");
+    }
+
+    #[test]
+    fn reversed_search_preserves_original_shortlex_tie_break() {
+        let config = Config::default();
+        let left_expr = parse("ab|ba", &config).unwrap();
+        let right_expr = parse(r"[^\d\D]", &config).unwrap();
+        let left = Nfa::from_expr(&left_expr);
+        let right = Nfa::from_expr(&right_expr);
+        let result = search_product_reversed(Query::Equivalent, &left, &right, &config);
+        assert_eq!(result.status, BackendStatus::Found);
+        // A naive first-found reverse BFS sees reverse-word "ab" first and
+        // would return "ba".  The public contract requires original-word
+        // shortlex, hence "ab".
+        assert_eq!(result.witness.as_deref(), Some("ab"));
+        assert_eq!(result.relation.as_deref(), Some(relation::LEFT_ONLY));
+    }
+
+    #[test]
+    fn reverse_probe_solves_suffix_window_with_bounded_probe() {
+        let config = Config {
+            max_product_states: 10_000,
+            timeout_ms: 1_500,
+            ..Config::default()
+        };
+        let report = analyze_binary(
+            Query::Equivalent,
+            "(a|b)*a(a|b){28}x",
+            "(a|b)*a(a|b){28}y",
+            &config,
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::No);
+        let witness = report.witness.unwrap();
+        assert_eq!(witness.codepoints, 30);
+        assert!(report.statistics.visited_product_states <= 512);
     }
 
     #[test]
