@@ -21,6 +21,33 @@ pub enum Query {
     Match,
 }
 
+/// Direction in which a relation backend sees the input languages.
+///
+/// Reversal is semantics-preserving for the regular-language relations this
+/// crate decides. `Auto` spends a small bounded probe in each direction for
+/// binary relations, then continues in the direction that appears cheaper.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Orientation {
+    /// Analyze the languages exactly as written.
+    #[default]
+    Forward,
+    /// Analyze the reversed languages and map any witness back afterwards.
+    Reversed,
+    /// Probe both directions and continue with the cheaper one.
+    Auto,
+}
+
+impl Orientation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Reversed => "reversed",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AnalyzeError {
     #[error(transparent)]
@@ -84,6 +111,25 @@ pub trait RelationBackend {
 
     fn version(&self) -> &'static str;
 
+    /// Orientation layer applied around this backend. Plain backends are
+    /// forward; [`OrientedBackend`] overrides this for reporting.
+    fn orientation(&self) -> &'static str {
+        "forward"
+    }
+
+    /// Witness-order contract advertised in reports.
+    fn witness_order(&self) -> &'static str {
+        "shortest_codepoint_length_then_lowest_scalar_value"
+    }
+
+    /// Witness ordering after a reversed-language search is mapped back to
+    /// the original direction. Most backends preserve minimum length but not
+    /// the original lexical tie-break. A backend with an exact reverse search
+    /// can override this together with [`analyze_binary_reversed_nfa`].
+    fn reversed_witness_order(&self) -> &'static str {
+        "shortest_codepoint_length_then_orientation_specific_tie_break"
+    }
+
     /// NFA-only entry point. Backends whose analysis genuinely only needs
     /// the compiled automaton (e.g. [`AutomataBackend`], [`MinimizedBackend`])
     /// implement this directly. Backends that instead work from residual
@@ -105,6 +151,20 @@ pub trait RelationBackend {
         right: &Nfa,
         config: &Config,
     ) -> BackendResult;
+
+    /// Optional hook for a backend that can search reversed languages while
+    /// preserving the public witness ordering in the original direction.
+    /// The generic orientation layer falls back to ordinary language
+    /// reversal when this is not implemented.
+    fn analyze_binary_reversed_nfa(
+        &self,
+        _query: Query,
+        _left: &Nfa,
+        _right: &Nfa,
+        _config: &Config,
+    ) -> Option<BackendResult> {
+        None
+    }
 
     /// NFA-only emptiness entry point. See [`analyze_binary`] for the same
     /// caveat: residual-expression backends return
@@ -249,11 +309,574 @@ impl RelationBackend for AutomataBackend {
         right: &Nfa,
         config: &Config,
     ) -> BackendResult {
-        search_product_auto(query, left, right, config)
+        search_product(query, left, right, config)
+    }
+
+    fn analyze_binary_reversed_nfa(
+        &self,
+        query: Query,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> Option<BackendResult> {
+        Some(search_product_reversed(query, left, right, config))
+    }
+
+    fn reversed_witness_order(&self) -> &'static str {
+        self.witness_order()
     }
 
     fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult {
         search_single(nfa, config)
+    }
+}
+
+/// On-the-fly subset-product backend with a bounded reverse-language probe.
+///
+/// This is intentionally separate from [`AutomataBackend`]: selecting
+/// `automata` preserves the historical forward-only search, while callers
+/// that explicitly choose `reversal` opt into the directional probe before
+/// the same forward fallback.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReversalBackend;
+
+impl RelationBackend for ReversalBackend {
+    fn name(&self) -> &'static str {
+        "reversal"
+    }
+
+    fn version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    fn orientation(&self) -> &'static str {
+        "auto"
+    }
+
+    fn analyze_binary(
+        &self,
+        query: Query,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        search_product_reversal(query, left, right, config)
+    }
+
+    fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult {
+        search_single(nfa, config)
+    }
+}
+
+/// General-purpose orientation wrapper for any [`RelationBackend`].
+///
+/// `Reversed` transforms both the AST and NFA before delegating, so AST-based
+/// backends (Brzozowski/Antimirov) and automata-based backends see the same
+/// reversed language. `Auto` uses bounded forward/reverse probes for binary
+/// relations and then spends the remaining caller budget in the cheaper
+/// direction. Unary `empty`/`match` use forward mode under `Auto`, because
+/// there is no product-direction blow-up to estimate there.
+#[derive(Clone, Copy)]
+pub struct OrientedBackend<'a> {
+    inner: &'a dyn RelationBackend,
+    orientation: Orientation,
+}
+
+impl<'a> OrientedBackend<'a> {
+    pub fn new(inner: &'a dyn RelationBackend, orientation: Orientation) -> Self {
+        Self { inner, orientation }
+    }
+
+    pub fn inner(&self) -> &'a dyn RelationBackend {
+        self.inner
+    }
+
+    pub fn selected_orientation(&self) -> Orientation {
+        self.orientation
+    }
+
+    fn analyze_binary_reversed_nfa(
+        &self,
+        query: Query,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        if let Some(result) = self
+            .inner
+            .analyze_binary_reversed_nfa(query, left, right, config)
+        {
+            return result;
+        }
+        let left_reversed = left.reversed();
+        let right_reversed = right.reversed();
+        map_reversed_result(self.inner.analyze_binary(
+            query,
+            &left_reversed,
+            &right_reversed,
+            config,
+        ))
+    }
+}
+
+const ORIENTATION_PROBE_STATES: usize = 512;
+const ORIENTATION_PROBE_MS: u64 = 50;
+
+fn reverse_string(value: &str) -> String {
+    value.chars().rev().collect()
+}
+
+fn map_reversed_result(mut result: BackendResult) -> BackendResult {
+    if let Some(witness) = result.witness.as_mut() {
+        *witness = reverse_string(witness);
+    }
+    result
+}
+
+fn is_definitive(status: BackendStatus) -> bool {
+    matches!(status, BackendStatus::Found | BackendStatus::Exhausted)
+}
+
+fn orientation_probe_config(config: &Config) -> Config {
+    let mut probe = config.clone();
+    probe.max_product_states = config
+        .max_product_states
+        .div_ceil(20)
+        .clamp(1, ORIENTATION_PROBE_STATES);
+    probe.timeout_ms = config
+        .timeout_ms
+        .div_ceil(20)
+        .clamp(1, ORIENTATION_PROBE_MS);
+    probe
+}
+
+fn prefer_reversed_probe(forward: &BackendResult, reversed: &BackendResult) -> bool {
+    // A timeout is a stronger signal of an expensive orientation than merely
+    // filling a small state probe quickly. After that, use generated work,
+    // visited states, then elapsed time. Exact ties deliberately prefer the
+    // historical forward direction.
+    let score = |result: &BackendResult| {
+        (
+            usize::from(u8::from(matches!(result.status, BackendStatus::Timeout))),
+            result.generated_transitions,
+            result.visited_states,
+            result.analysis_ms,
+        )
+    };
+    score(reversed) < score(forward)
+}
+
+fn add_attempt_work(result: &mut BackendResult, earlier: &[&BackendResult], started: Instant) {
+    for attempt in earlier {
+        result.visited_states = result.visited_states.saturating_add(attempt.visited_states);
+        result.generated_transitions = result
+            .generated_transitions
+            .saturating_add(attempt.generated_transitions);
+        result.witness_extraction_ms = result
+            .witness_extraction_ms
+            .saturating_add(attempt.witness_extraction_ms);
+    }
+    result.analysis_ms = started
+        .elapsed()
+        .as_millis()
+        .saturating_sub(result.witness_extraction_ms);
+}
+
+fn stopped_after_orientation_probes(
+    status: BackendStatus,
+    forward: &BackendResult,
+    reversed: &BackendResult,
+    started: Instant,
+) -> BackendResult {
+    BackendResult {
+        status,
+        witness: None,
+        relation: None,
+        visited_states: forward
+            .visited_states
+            .saturating_add(reversed.visited_states),
+        generated_transitions: forward
+            .generated_transitions
+            .saturating_add(reversed.generated_transitions),
+        analysis_ms: started.elapsed().as_millis(),
+        witness_extraction_ms: forward
+            .witness_extraction_ms
+            .saturating_add(reversed.witness_extraction_ms),
+    }
+}
+
+impl RelationBackend for OrientedBackend<'_> {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn version(&self) -> &'static str {
+        self.inner.version()
+    }
+
+    fn orientation(&self) -> &'static str {
+        match self.orientation {
+            Orientation::Forward => self.inner.orientation(),
+            Orientation::Reversed => "reversed",
+            Orientation::Auto => "auto",
+        }
+    }
+
+    fn witness_order(&self) -> &'static str {
+        match self.orientation {
+            Orientation::Forward => self.inner.witness_order(),
+            Orientation::Reversed => self.inner.reversed_witness_order(),
+            Orientation::Auto
+                if self.inner.witness_order() == self.inner.reversed_witness_order() =>
+            {
+                self.inner.witness_order()
+            }
+            Orientation::Auto => "shortest_codepoint_length_then_orientation_specific_tie_break",
+        }
+    }
+
+    fn analyze_binary(
+        &self,
+        query: Query,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        match self.orientation {
+            Orientation::Forward => self.inner.analyze_binary(query, left, right, config),
+            Orientation::Reversed => self.analyze_binary_reversed_nfa(query, left, right, config),
+            Orientation::Auto => self.analyze_binary_auto_nfa(query, left, right, config),
+        }
+    }
+
+    fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult {
+        match self.orientation {
+            Orientation::Reversed => {
+                let reversed = nfa.reversed();
+                map_reversed_result(self.inner.analyze_empty(&reversed, config))
+            }
+            Orientation::Forward | Orientation::Auto => self.inner.analyze_empty(nfa, config),
+        }
+    }
+
+    fn analyze_binary_expr(
+        &self,
+        query: Query,
+        left_expr: &crate::ast::Expr,
+        right_expr: &crate::ast::Expr,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        match self.orientation {
+            Orientation::Forward => self
+                .inner
+                .analyze_binary_expr(query, left_expr, right_expr, left, right, config),
+            Orientation::Reversed => {
+                self.analyze_binary_reversed_expr(query, left_expr, right_expr, left, right, config)
+            }
+            Orientation::Auto => {
+                self.analyze_binary_auto_expr(query, left_expr, right_expr, left, right, config)
+            }
+        }
+    }
+
+    fn analyze_empty_expr(
+        &self,
+        expr: &crate::ast::Expr,
+        nfa: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        match self.orientation {
+            Orientation::Reversed => {
+                let reversed_expr = expr.reversed();
+                let reversed_nfa = nfa.reversed();
+                map_reversed_result(self.inner.analyze_empty_expr(
+                    &reversed_expr,
+                    &reversed_nfa,
+                    config,
+                ))
+            }
+            Orientation::Forward | Orientation::Auto => {
+                self.inner.analyze_empty_expr(expr, nfa, config)
+            }
+        }
+    }
+
+    fn match_input(
+        &self,
+        expr: &crate::ast::Expr,
+        nfa: &Nfa,
+        input: &str,
+        config: &Config,
+    ) -> BackendResult {
+        match self.orientation {
+            Orientation::Reversed => {
+                let reversed_expr = expr.reversed();
+                let reversed_nfa = nfa.reversed();
+                let reversed_input = reverse_string(input);
+                map_reversed_result(self.inner.match_input(
+                    &reversed_expr,
+                    &reversed_nfa,
+                    &reversed_input,
+                    config,
+                ))
+            }
+            Orientation::Forward | Orientation::Auto => {
+                self.inner.match_input(expr, nfa, input, config)
+            }
+        }
+    }
+}
+
+impl OrientedBackend<'_> {
+    fn analyze_binary_reversed_expr(
+        &self,
+        query: Query,
+        left_expr: &crate::ast::Expr,
+        right_expr: &crate::ast::Expr,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        if let Some(result) = self
+            .inner
+            .analyze_binary_reversed_nfa(query, left, right, config)
+        {
+            return result;
+        }
+        let reversed_left_expr = left_expr.reversed();
+        let reversed_right_expr = right_expr.reversed();
+        let reversed_left = left.reversed();
+        let reversed_right = right.reversed();
+        map_reversed_result(self.inner.analyze_binary_expr(
+            query,
+            &reversed_left_expr,
+            &reversed_right_expr,
+            &reversed_left,
+            &reversed_right,
+            config,
+        ))
+    }
+
+    fn analyze_binary_auto_nfa(
+        &self,
+        query: Query,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        let started = Instant::now();
+        let probe_config = orientation_probe_config(config);
+        let forward = self.inner.analyze_binary(query, left, right, &probe_config);
+        if is_definitive(forward.status) {
+            let mut result = forward;
+            result.analysis_ms = started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(result.witness_extraction_ms);
+            return result;
+        }
+
+        let reversed_left = left.reversed();
+        let reversed_right = right.reversed();
+        let reversed = if let Some(result) =
+            self.inner
+                .analyze_binary_reversed_nfa(query, left, right, &probe_config)
+        {
+            result
+        } else {
+            map_reversed_result(self.inner.analyze_binary(
+                query,
+                &reversed_left,
+                &reversed_right,
+                &probe_config,
+            ))
+        };
+        if is_definitive(reversed.status) {
+            let mut result = reversed;
+            add_attempt_work(&mut result, &[&forward], started);
+            return result;
+        }
+
+        self.continue_auto_nfa(
+            query,
+            left,
+            right,
+            &reversed_left,
+            &reversed_right,
+            config,
+            forward,
+            reversed,
+            started,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn continue_auto_nfa(
+        &self,
+        query: Query,
+        left: &Nfa,
+        right: &Nfa,
+        reversed_left: &Nfa,
+        reversed_right: &Nfa,
+        config: &Config,
+        forward: BackendResult,
+        reversed: BackendResult,
+        started: Instant,
+    ) -> BackendResult {
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= u128::from(config.timeout_ms) {
+            return stopped_after_orientation_probes(
+                BackendStatus::Timeout,
+                &forward,
+                &reversed,
+                started,
+            );
+        }
+        let used_states = forward
+            .visited_states
+            .saturating_add(reversed.visited_states);
+        let remaining_states = config.max_product_states.saturating_sub(used_states);
+        if remaining_states == 0 {
+            return stopped_after_orientation_probes(
+                BackendStatus::StateLimit,
+                &forward,
+                &reversed,
+                started,
+            );
+        }
+        let mut remaining = config.clone();
+        remaining.max_product_states = remaining_states;
+        remaining.timeout_ms =
+            (u128::from(config.timeout_ms) - elapsed_ms).min(u128::from(u64::MAX)) as u64;
+        remaining.timeout_ms = remaining.timeout_ms.max(1);
+
+        let choose_reversed = prefer_reversed_probe(&forward, &reversed);
+        let mut result = if choose_reversed {
+            if let Some(result) = self
+                .inner
+                .analyze_binary_reversed_nfa(query, left, right, &remaining)
+            {
+                result
+            } else {
+                map_reversed_result(self.inner.analyze_binary(
+                    query,
+                    reversed_left,
+                    reversed_right,
+                    &remaining,
+                ))
+            }
+        } else {
+            self.inner.analyze_binary(query, left, right, &remaining)
+        };
+        add_attempt_work(&mut result, &[&forward, &reversed], started);
+        result
+    }
+
+    fn analyze_binary_auto_expr(
+        &self,
+        query: Query,
+        left_expr: &crate::ast::Expr,
+        right_expr: &crate::ast::Expr,
+        left: &Nfa,
+        right: &Nfa,
+        config: &Config,
+    ) -> BackendResult {
+        let started = Instant::now();
+        let probe_config = orientation_probe_config(config);
+        let forward = self.inner.analyze_binary_expr(
+            query,
+            left_expr,
+            right_expr,
+            left,
+            right,
+            &probe_config,
+        );
+        if is_definitive(forward.status) {
+            let mut result = forward;
+            result.analysis_ms = started
+                .elapsed()
+                .as_millis()
+                .saturating_sub(result.witness_extraction_ms);
+            return result;
+        }
+
+        let reversed_left_expr = left_expr.reversed();
+        let reversed_right_expr = right_expr.reversed();
+        let reversed_left = left.reversed();
+        let reversed_right = right.reversed();
+        let reversed = if let Some(result) =
+            self.inner
+                .analyze_binary_reversed_nfa(query, left, right, &probe_config)
+        {
+            result
+        } else {
+            map_reversed_result(self.inner.analyze_binary_expr(
+                query,
+                &reversed_left_expr,
+                &reversed_right_expr,
+                &reversed_left,
+                &reversed_right,
+                &probe_config,
+            ))
+        };
+        if is_definitive(reversed.status) {
+            let mut result = reversed;
+            add_attempt_work(&mut result, &[&forward], started);
+            return result;
+        }
+
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms >= u128::from(config.timeout_ms) {
+            return stopped_after_orientation_probes(
+                BackendStatus::Timeout,
+                &forward,
+                &reversed,
+                started,
+            );
+        }
+        let used_states = forward
+            .visited_states
+            .saturating_add(reversed.visited_states);
+        let remaining_states = config.max_product_states.saturating_sub(used_states);
+        if remaining_states == 0 {
+            return stopped_after_orientation_probes(
+                BackendStatus::StateLimit,
+                &forward,
+                &reversed,
+                started,
+            );
+        }
+        let mut remaining = config.clone();
+        remaining.max_product_states = remaining_states;
+        remaining.timeout_ms =
+            (u128::from(config.timeout_ms) - elapsed_ms).min(u128::from(u64::MAX)) as u64;
+        remaining.timeout_ms = remaining.timeout_ms.max(1);
+
+        let choose_reversed = prefer_reversed_probe(&forward, &reversed);
+        let mut result = if choose_reversed {
+            if let Some(result) = self
+                .inner
+                .analyze_binary_reversed_nfa(query, left, right, &remaining)
+            {
+                result
+            } else {
+                map_reversed_result(self.inner.analyze_binary_expr(
+                    query,
+                    &reversed_left_expr,
+                    &reversed_right_expr,
+                    &reversed_left,
+                    &reversed_right,
+                    &remaining,
+                ))
+            }
+        } else {
+            self.inner
+                .analyze_binary_expr(query, left_expr, right_expr, left, right, &remaining)
+        };
+        add_attempt_work(&mut result, &[&forward, &reversed], started);
+        result
     }
 }
 
@@ -370,15 +993,20 @@ pub fn analyze_empty_with_backend(
 /// The hard suffix-window family in the benchmark suite blows up under
 /// left-to-right determinization but collapses after language reversal.  A
 /// full "always reverse" policy would merely move that pathology to prefix-
-/// heavy inputs, so the default backend spends only a small, bounded slice of
-/// the existing budget on reversal.  If the probe proves the relation or finds
-/// a counterexample, we are done; otherwise the historical forward search gets
-/// the remaining global time/state budget.
+/// heavy inputs, so the explicit reversal backend spends only a small, bounded
+/// slice of the existing budget on reversal.  If the probe proves the relation
+/// or finds a counterexample, we are done; otherwise the historical forward
+/// search gets the remaining global time/state budget.
 ///
 /// Reversal is currently used for inclusion/equivalence, where the audit found
 /// the large directional gap.  Overlap keeps its existing path (and antichain
 /// mode already has a query-specific NFA-state product for it).
-fn search_product_auto(query: Query, left: &Nfa, right: &Nfa, config: &Config) -> BackendResult {
+fn search_product_reversal(
+    query: Query,
+    left: &Nfa,
+    right: &Nfa,
+    config: &Config,
+) -> BackendResult {
     if !matches!(query, Query::Includes | Query::Equivalent) {
         return search_product(query, left, right, config);
     }
@@ -1175,6 +1803,7 @@ fn base_report(
         backend: BackendInfo {
             name: backend.name().to_owned(),
             version: backend.version().to_owned(),
+            orientation: backend.orientation().to_owned(),
         },
         query,
         verdict,
@@ -1196,7 +1825,7 @@ fn base_report(
             alphabet: config.alphabet,
             timings,
         },
-        semantics: semantics(config),
+        semantics: semantics(config, backend),
     }
 }
 
@@ -1214,6 +1843,7 @@ fn unsupported_report(
         backend: BackendInfo {
             name: backend.name().to_owned(),
             version: backend.version().to_owned(),
+            orientation: backend.orientation().to_owned(),
         },
         query,
         verdict: Verdict::Unsupported,
@@ -1242,7 +1872,7 @@ fn unsupported_report(
                 timings
             },
         },
-        semantics: semantics(config),
+        semantics: semantics(config, backend),
     }
 }
 
@@ -1257,10 +1887,10 @@ fn assumptions(config: &Config) -> Vec<String> {
     ]
 }
 
-fn semantics(config: &Config) -> Semantics {
+fn semantics(config: &Config, backend: &dyn RelationBackend) -> Semantics {
     Semantics {
         match_mode: "full_string",
-        witness_order: "shortest_codepoint_length_then_lowest_scalar_value",
+        witness_order: backend.witness_order(),
         shorthand_classes: "ascii_defined",
         dot_matches_newline: config.dot_matches_newline,
         // Completed verdicts are exact. Resource limits stop with UNKNOWN rather than
@@ -1393,17 +2023,148 @@ mod tests {
             timeout_ms: 1_500,
             ..Config::default()
         };
-        let report = analyze_binary(
+        let report = analyze_binary_with_backend(
             Query::Equivalent,
             "(a|b)*a(a|b){28}x",
             "(a|b)*a(a|b){28}y",
             &config,
+            &ReversalBackend,
         )
         .unwrap();
         assert_eq!(report.verdict, Verdict::No);
         let witness = report.witness.unwrap();
         assert_eq!(witness.codepoints, 30);
         assert!(report.statistics.visited_product_states <= 512);
+    }
+
+    #[test]
+    fn automata_backend_stays_forward_only_while_reversal_is_opt_in() {
+        let config = Config {
+            max_product_states: 10_000,
+            timeout_ms: 30_000,
+            ..Config::default()
+        };
+        let left_expr = parse("(a|b)*a(a|b){28}x", &config).unwrap();
+        let right_expr = parse("(a|b)*a(a|b){28}y", &config).unwrap();
+        let left = Nfa::from_expr(&left_expr);
+        let right = Nfa::from_expr(&right_expr);
+
+        let forward = AutomataBackend.analyze_binary(Query::Equivalent, &left, &right, &config);
+        assert_eq!(forward.status, BackendStatus::StateLimit);
+
+        let reversed = ReversalBackend.analyze_binary(Query::Equivalent, &left, &right, &config);
+        assert_eq!(reversed.status, BackendStatus::Found);
+        let witness = reversed.witness.as_deref().unwrap();
+        assert_eq!(witness.chars().count(), 30);
+        assert!(left.matches(witness));
+        assert!(!right.matches(witness));
+        assert_eq!(reversed.relation.as_deref(), Some(relation::LEFT_ONLY));
+        assert!(reversed.visited_states <= 512);
+    }
+
+    #[test]
+    fn automata_reversed_orientation_uses_exact_shortlex_hook() {
+        let backend = OrientedBackend::new(&AutomataBackend, Orientation::Reversed);
+        let report = analyze_binary_with_backend(
+            Query::Equivalent,
+            "ab|ba",
+            r"[^\d\D]",
+            &Config::default(),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::No);
+        assert_eq!(
+            report.semantics.witness_order,
+            "shortest_codepoint_length_then_lowest_scalar_value"
+        );
+        assert_eq!(report.witness.unwrap().value, "ab");
+    }
+
+    #[test]
+    fn generic_reversed_orientation_wraps_ast_backend() {
+        let backend =
+            OrientedBackend::new(&crate::derivative::DerivativeBackend, Orientation::Reversed);
+        let report = analyze_binary_with_backend(
+            Query::Equivalent,
+            "ab|ac",
+            "a(b|c)",
+            &Config::default(),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert_eq!(report.backend.name, "brzozowski_derivatives");
+        assert_eq!(report.backend.orientation, "reversed");
+        assert_eq!(
+            report.semantics.witness_order,
+            "shortest_codepoint_length_then_orientation_specific_tie_break"
+        );
+    }
+
+    #[test]
+    fn generic_reversed_orientation_wraps_every_backend_family() {
+        let abstraction = crate::abstraction::AbstractionBackend::with_inner(AutomataBackend);
+        let backends: [(&str, &dyn RelationBackend); 6] = [
+            ("minimized_dfa", &crate::minimize::MinimizedBackend),
+            ("antimirov", &crate::antimirov::AntimirovBackend),
+            ("antichain", &crate::antichain::AntichainBackend),
+            ("hkc", &crate::hkc::HkcBackend),
+            ("abstraction", &abstraction),
+            ("in_process_automata", &AutomataBackend),
+        ];
+
+        for (name, inner) in backends {
+            let backend = OrientedBackend::new(inner, Orientation::Reversed);
+            let report = analyze_binary_with_backend(
+                Query::Equivalent,
+                "ab|ac",
+                "a(b|c)",
+                &Config::default(),
+                &backend,
+            )
+            .unwrap();
+            assert_eq!(report.verdict, Verdict::Yes, "backend={name}");
+            assert_eq!(report.backend.name, name);
+            assert_eq!(report.backend.orientation, "reversed");
+        }
+    }
+
+    #[test]
+    fn generic_auto_orientation_solves_suffix_window_with_automata() {
+        let config = Config {
+            max_product_states: 10_000,
+            timeout_ms: 1_500,
+            ..Config::default()
+        };
+        let backend = OrientedBackend::new(&AutomataBackend, Orientation::Auto);
+        let report = analyze_binary_with_backend(
+            Query::Equivalent,
+            "(a|b)*a(a|b){28}x",
+            "(a|b)*a(a|b){28}y",
+            &config,
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::No);
+        assert_eq!(report.backend.name, "in_process_automata");
+        assert_eq!(report.backend.orientation, "auto");
+        assert_eq!(
+            report.semantics.witness_order,
+            "shortest_codepoint_length_then_lowest_scalar_value"
+        );
+        assert_eq!(report.witness.unwrap().codepoints, 30);
+        assert!(report.statistics.visited_product_states <= 1_024);
+    }
+
+    #[test]
+    fn reversed_orientation_maps_match_input_back_to_original_direction() {
+        let backend =
+            OrientedBackend::new(&crate::derivative::DerivativeBackend, Orientation::Reversed);
+        let report =
+            analyze_match_with_backend("ab+c", "abbc", &Config::default(), &backend).unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        assert_eq!(report.witness.unwrap().value, "abbc");
     }
 
     #[test]

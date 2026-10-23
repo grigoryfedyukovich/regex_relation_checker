@@ -42,6 +42,13 @@ Report (text or JSON) + optional shortest witness
 
 ## Backend contract
 
+`analysis::OrientedBackend` is an orthogonal execution wrapper around any of
+these engines. `reversed` transforms both `Expr` and `Nfa` before delegation;
+`auto` runs bounded forward/reverse probes for binary relations and continues
+in the cheaper direction. The CLI applies this wrapper *after* selecting the
+outer backend, so it also works around `AbstractionBackend` regardless of its
+configured inner engine.
+
 Every backend returns a `BackendResult` with status (`Found`, `Exhausted`,
 `StateLimit`, `Timeout`), optional witness, and counters. The orchestration
 layer maps that into a user-facing `Verdict` (`YES` / `NO` / `UNKNOWN` /

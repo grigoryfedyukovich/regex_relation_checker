@@ -165,6 +165,7 @@ fn json_is_versioned_and_structured() {
         report["backend"]["name"].as_str(),
         Some("in_process_automata")
     );
+    assert_eq!(report["backend"]["orientation"].as_str(), Some("forward"));
 
     let timings = &report["statistics"]["timings"];
     let component_sum = [
@@ -187,6 +188,54 @@ fn json_is_versioned_and_structured() {
     assert!(assumptions
         .iter()
         .any(|value| value.as_str() == Some("dot_matches_newline is false")));
+}
+
+#[test]
+fn reversal_backend_is_explicit_and_reported() {
+    let output = Command::cargo_bin("regexrel")
+        .unwrap()
+        .args([
+            "--backend",
+            "reversal",
+            "--json",
+            "equivalent",
+            "a|b",
+            "[ab]",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["verdict"].as_str(), Some("YES"));
+    assert_eq!(report["backend"]["name"].as_str(), Some("reversal"));
+}
+
+#[test]
+fn orientation_is_orthogonal_to_backend_selection() {
+    let output = Command::cargo_bin("regexrel")
+        .unwrap()
+        .args([
+            "--backend",
+            "derivatives",
+            "--orientation",
+            "reversed",
+            "--json",
+            "equivalent",
+            "ab|ac",
+            "a(b|c)",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["verdict"].as_str(), Some("YES"));
+    assert_eq!(
+        report["backend"]["name"].as_str(),
+        Some("brzozowski_derivatives")
+    );
+    assert_eq!(report["backend"]["orientation"].as_str(), Some("reversed"));
 }
 
 #[test]

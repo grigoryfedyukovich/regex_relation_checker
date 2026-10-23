@@ -2,15 +2,26 @@
 
 ## Backends
 
-All seven engines (`automata`, `minimized`, `derivatives`, `antimirov`,
-`antichain`, `hkc`, `abstraction`) decide the same regular subset. They may
+All eight engines (`automata`, `reversal`, `minimized`, `derivatives`,
+`antimirov`, `antichain`, `hkc`, `abstraction`) decide the same regular subset. They may
 hit `max_product_states` or `timeout_ms` on different inputs; a completed
 `YES`/`NO` from any backend is exact. Suffix-tracking patterns such as
-`(a|b)*a(a|b){n}` can exhaust practical limits on every current engine —
-see `bench/README.md` and `docs/backends.md`.
+`(a|b)*a(a|b){n}` can exhaust the forward `automata` backend while becoming
+small under the opt-in `reversal` backend; inputs hard in both directions can
+still exhaust practical limits. See `bench/README.md` and `docs/backends.md`.
 
-`abstraction` is a special case: it delegates to a configurable inner
-engine rather than being a seventh independent decision procedure, so it is
+`reversal` is not an independent decision procedure: it wraps the same
+subset-product search as `automata` with a bounded reverse-language probe.
+The general `--orientation reversed|auto` layer can wrap any backend. Reversal
+preserves all supported language relations and shortest witness length. For
+`automata`, a dedicated reverse-DAG reconstruction also preserves the original
+lexicographic tie-break. Other backends currently expose only their final
+witness, not their equal-depth predecessor structure, so a reversed tied
+witness can differ from the forward canonical same-length witness after it is
+mapped back. This affects deterministic witness tie selection only, never the
+verdict or witness validity.
+`abstraction` is another special case: it delegates to a configurable inner
+engine rather than being an independent decision procedure, so it is
 not currently exercised by the `tests/backend_agreement.rs` differential
 suite the other six are (see `docs/backends.md`). It only helps prove `YES` when the two
 patterns share a large subexpression verbatim; on a real `NO`, or on

@@ -6,7 +6,7 @@ Required top-level fields:
 
 - `schema_version`: machine-readable contract version
 - `tool_version`: crate version
-- `backend`: backend name and version
+- `backend`: backend name, version, and orientation (`forward`, `reversed`, or `auto`)
 - `query`: `empty`, `overlap`, `includes`, or `equivalent`
 - `verdict`: `YES`, `NO`, `UNKNOWN`, or `UNSUPPORTED`
 - `diagnostic`: stable ID, message, optional frontend error, and effective assumptions
@@ -20,6 +20,16 @@ Required top-level fields:
 - `codepoints`: Unicode scalar count
 
 The witness is the structured evidence for relation reports; schema v1 does not duplicate it inside `diagnostic`.
+
+`semantics.witness_order` is
+`shortest_codepoint_length_then_lowest_scalar_value` for ordinary forward
+analysis. The automata backend reports the same contract under `reversed` and
+`auto`, because its dedicated reverse shortest-path DAG recovers the original
+lexical tie. Other backends report
+`shortest_codepoint_length_then_orientation_specific_tie_break` whenever the
+configured orientation may use reversal, because they do not expose enough
+predecessor information to recover the original forward lexical tie among
+equal-length witnesses.
 
 ## Timing fields
 

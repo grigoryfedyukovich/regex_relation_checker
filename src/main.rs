@@ -8,7 +8,8 @@ use regexrel::report::{relation, Report, Timings, Verdict};
 use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend, draw_dot,
     render_graph, AbstractionBackend, AntichainBackend, AntimirovBackend, AutomataBackend,
-    DerivativeBackend, DrawError, DrawKind, HkcBackend, MinimizedBackend, Query, RelationBackend,
+    DerivativeBackend, DrawError, DrawKind, HkcBackend, MinimizedBackend, Orientation,
+    OrientedBackend, Query, RelationBackend, ReversalBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -91,6 +92,13 @@ struct Cli {
     #[arg(long, value_enum, default_value = "automata", global = true)]
     backend: BackendArg,
 
+    /// Direction in which the selected backend analyzes the language(s).
+    /// `forward` is historical behavior; `reversed` reverses the regular
+    /// languages before dispatch; `auto` probes both directions for binary
+    /// relations and continues in the cheaper direction.
+    #[arg(long, value_enum, default_value = "forward", global = true)]
+    orientation: OrientationArg,
+
     /// Inner engine used by `--backend abstraction` for each CEGAR round and
     /// for the concrete fall-back. Ignored for every other outer backend.
     /// Defaults to `automata` (the historical behaviour).
@@ -122,12 +130,36 @@ struct Cli {
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum OrientationArg {
+    /// Analyze the languages exactly as written (default).
+    #[default]
+    Forward,
+    /// Reverse the language(s) before invoking the selected backend.
+    Reversed,
+    /// Probe both directions for binary relations, then continue with the
+    /// direction that appears cheaper. Unary queries stay forward.
+    Auto,
+}
+
+impl From<OrientationArg> for Orientation {
+    fn from(value: OrientationArg) -> Self {
+        match value {
+            OrientationArg::Forward => Orientation::Forward,
+            OrientationArg::Reversed => Orientation::Reversed,
+            OrientationArg::Auto => Orientation::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
 enum BackendArg {
-    /// On-the-fly subset products. Inclusion/equivalence first get a small
-    /// reverse-language probe, then fall back to the forward BFS if needed.
-    /// The default; well-exercised, no upfront determinization cost.
+    /// Historical forward-only on-the-fly subset product. The default;
+    /// well-exercised, no upfront determinization cost.
     #[default]
     Automata,
+    /// Automata backend with a bounded reverse-language probe for
+    /// inclusion/equivalence before falling back to the forward BFS.
+    Reversal,
     /// Determinize and minimize each pattern first, then check equivalence
     /// via canonical-form isomorphism (no search needed when it holds) or
     /// fall back to a product search over the minimized DFAs otherwise.
@@ -475,8 +507,9 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
     let abs_antichain = AbstractionBackend::with_inner(AntichainBackend);
     let abs_hkc = AbstractionBackend::with_inner(HkcBackend);
 
-    let backend: &dyn RelationBackend = match (cli.backend, cli.abstraction_inner) {
+    let base_backend: &dyn RelationBackend = match (cli.backend, cli.abstraction_inner) {
         (BackendArg::Automata, _) => &AutomataBackend,
+        (BackendArg::Reversal, _) => &ReversalBackend,
         (BackendArg::Minimized, _) => &MinimizedBackend,
         (BackendArg::Derivatives, _) => &DerivativeBackend,
         (BackendArg::Antimirov, _) => &AntimirovBackend,
@@ -489,6 +522,8 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         (BackendArg::Abstraction, AbstractionInnerArg::Antichain) => &abs_antichain,
         (BackendArg::Abstraction, AbstractionInnerArg::Hkc) => &abs_hkc,
     };
+    let oriented_backend = OrientedBackend::new(base_backend, cli.orientation.into());
+    let backend: &dyn RelationBackend = &oriented_backend;
 
     let mut report = match command {
         Command::Empty { regex } => analyze_empty_with_backend(regex, &config, backend),

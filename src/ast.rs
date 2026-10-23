@@ -27,6 +27,34 @@ pub struct Expr {
 }
 
 impl Expr {
+    /// Return an expression denoting the reversed language.
+    ///
+    /// Concatenation order is reversed recursively; alternation and
+    /// repetition keep their structure while reversing their operands.
+    /// Outer boundary anchors swap roles under reversal.
+    pub fn reversed(&self) -> Self {
+        let kind = match &self.kind {
+            ExprKind::Empty => ExprKind::Empty,
+            ExprKind::Literal(ch) => ExprKind::Literal(*ch),
+            ExprKind::CharSet(set) => ExprKind::CharSet(set.clone()),
+            ExprKind::Concat(parts) => {
+                ExprKind::Concat(parts.iter().rev().map(Expr::reversed).collect())
+            }
+            ExprKind::Alt(branches) => ExprKind::Alt(branches.iter().map(Expr::reversed).collect()),
+            ExprKind::Repeat { expr, min, max } => ExprKind::Repeat {
+                expr: Box::new(expr.reversed()),
+                min: *min,
+                max: *max,
+            },
+            ExprKind::AnchorStart => ExprKind::AnchorEnd,
+            ExprKind::AnchorEnd => ExprKind::AnchorStart,
+        };
+        Self {
+            kind,
+            span: self.span,
+        }
+    }
+
     /// Crate-private: an `Expr` is only ever meant to be built by the
     /// parser (or, internally, by the CEGAR/normalization passes that
     /// rewrite an already-parsed tree). Keeping this internal, together

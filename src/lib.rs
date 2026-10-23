@@ -25,7 +25,7 @@ pub use abstraction::AbstractionBackend;
 pub use analysis::{
     analyze_binary, analyze_binary_with_backend, analyze_empty, analyze_empty_with_backend,
     analyze_match, analyze_match_with_backend, AnalyzeError, AutomataBackend, BackendResult,
-    BackendStatus, Query, RelationBackend,
+    BackendStatus, Orientation, OrientedBackend, Query, RelationBackend, ReversalBackend,
 };
 pub use antichain::AntichainBackend;
 pub use antimirov::AntimirovBackend;

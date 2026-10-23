@@ -107,6 +107,8 @@ pub struct Semantics {
 pub struct BackendInfo {
     pub name: String,
     pub version: String,
+    /// Direction wrapper applied around the selected backend.
+    pub orientation: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

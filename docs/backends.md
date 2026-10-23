@@ -1,19 +1,48 @@
 # Analysis backends
 
-`regexrel` implements seven engines behind one CLI and library API. Select
-with `--backend <name>`. Six are fully independent decision procedures and
-must agree on every completed `YES` / `NO`; the seventh, `abstraction`, is a
-CEGAR driver that delegates each abstract round *and* the concrete fall-back
-to a configurable inner engine (default: `automata`; override with
-`--abstraction-inner`). Its verdicts are only as independent as that
-inner's — but it carries its own soundness argument for the fast path, and
-its own witness-replay check, on top.
+`regexrel` implements eight engines behind one CLI and library API. Select
+with `--backend <name>`. Six are fully independent decision procedures;
+`reversal` is an opt-in directional variant of `automata`, and `abstraction`
+is a CEGAR driver that delegates each abstract round *and* the concrete
+fall-back to a configurable inner engine (default: `automata`; override with
+`--abstraction-inner`). Completed `YES` / `NO` results must agree across all
+engines.
 Disagreement among the six independent engines is a bug; `UNKNOWN` means a
 resource limit was hit, not a soft “maybe”.
 
+## Orientation layer (orthogonal to the backend)
+
+`--orientation forward|reversed|auto` wraps whichever backend is selected.
+`forward` is the default and leaves the engine untouched. `reversed` reverses
+the parsed regular-language AST and the compiled NFA before dispatch, then
+reverses a returned witness back before validating it against the original
+languages. This makes the same transformation available to derivatives,
+partial derivatives, minimization, antichains, HKC, and abstraction rather
+than coupling it to the subset-product engine.
+
+`auto` is a bounded direction selector for binary relations. It first gives
+the forward direction 5% of the state/time budget (capped at 512 states /
+50 ms). If that does not decide the query, it gives the reversed direction
+the same probe. If neither is definitive, it subtracts both probes from the
+global budget and continues in the direction with the lower probe cost
+(timeout penalty, then generated transitions, visited states, elapsed time;
+exact ties choose forward). `empty` and concrete `match` stay forward under
+`auto`, while explicit `reversed` applies to both.
+
+For `automata`, the wrapper uses the dedicated reverse shortest-path DAG so
+the original shortest/lowest-scalar witness order is retained. For other
+backends the transformation preserves verdicts and shortest witness length,
+but reversing a backend's same-length tie choice produces colexicographic
+rather than necessarily lexicographic tie-breaking in the original direction.
+All returned witnesses are still replay-validated against the original NFAs.
+The older `--backend reversal` remains as an automata-specific compatibility
+mode; new code should generally prefer `--orientation auto` with the desired
+backend.
+
 | Flag value | Module | Core technique |
 |------------|--------|----------------|
-| `automata` (default) | `analysis.rs` | On-the-fly NFA subset product; bounded reverse-direction probe for inclusion/equivalence |
+| `automata` (default) | `analysis.rs` | Historical forward-only on-the-fly NFA subset product |
+| `reversal` | `analysis.rs` | Bounded reverse-direction probe for inclusion/equivalence, then forward automata fallback |
 | `minimized` | `minimize.rs` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | `derivative.rs` | Brzozowski residuals + product BFS on residual pairs |
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
@@ -26,11 +55,10 @@ local to one implementation is far more likely to surface as a backend
 disagreement than as a silent shared wrong answer. Integration tests in
 `tests/backend_agreement.rs` exercise this across those six backends
 (`automata`, `minimized`, `derivatives`, `antimirov`, `antichain`, `hkc`) on
-every `cargo test` run. `abstraction` is not yet in that differential-fuzzing
-loop (it has its own targeted unit tests in `abstraction.rs` instead, plus
-every returned witness is replayed against the concrete, unabstracted
-automata before it can reach the caller) — adding it to
-`backend_agreement.rs` is open follow-up work.
+every `cargo test` run. `reversal` is regression-tested against `automata`
+separately because it shares the same forward decision procedure, and
+`abstraction` has its own targeted unit tests in `abstraction.rs` plus
+concrete witness replay.
 
 ---
 
@@ -39,17 +67,8 @@ automata before it can reach the caller) — adding it to
 **Pipeline**
 
 1. Parse each pattern to an AST, compile to a Thompson ε-NFA.
-2. For `includes`/`equivalent`, reverse both NFAs and run a bounded product
-   probe (at most 10% of the configured time/state budget, capped at 50 ms /
-   512 states). Reversal preserves both relations and witness length.
-3. A successful reverse probe completes the entire first accepting BFS layer
-   and reconstructs from its shortest-path DAG so the returned word still
-   obeys the original shortest-then-lowest-scalar witness order. A naive
-   first-found reversed witness would only give colexicographic order.
-4. If the probe is inconclusive, run the historical forward subset-product BFS
-   with the remaining global budget. `overlap` and `empty` keep their existing
-   paths.
-5. Symbolic transitions use character-set partitions from both NFAs.
+2. Run the historical forward subset-product BFS directly.
+3. Symbolic transitions use character-set partitions from both NFAs.
 
 **Strengths**
 
@@ -60,11 +79,9 @@ automata before it can reach the caller) — adding it to
 **Weaknesses**
 
 - Product size tracks the *subset* lattice, not the minimal DFA.
-- Direction selection is deliberately only a bounded probe, not a full
-  bidirectional scheduler. Inputs hard in both directions can still explore
-  exponential subset structure.
-- Reverse probing currently targets `includes`/`equivalent`; query-specific
-  reversal for other NFA backends remains separate work.
+- Direction is fixed left-to-right. Suffix-window languages can therefore
+  expose exponential subset structure even when their reversed languages are
+  small.
 
 **When to use**
 
@@ -73,7 +90,49 @@ surprising cost model.
 
 ---
 
-## 2. `minimized` — determinize, minimize, then decide
+## 2. `reversal` — legacy automata-specific reverse probe + fallback
+
+This backend is the same NFA subset-product engine as `automata`, with one
+explicit directional heuristic in front of it.
+
+**Pipeline**
+
+1. Parse and compile exactly as `automata` does.
+2. For `includes`/`equivalent`, reverse both NFAs and run a bounded product
+   probe (at most 10% of the configured time/state budget, capped at 50 ms /
+   512 states). Reversal preserves both relations and witness length.
+3. A successful reverse probe completes the entire first accepting BFS layer
+   and reconstructs from its shortest-path DAG so the returned word still
+   obeys the original shortest-then-lowest-scalar witness order. A naive
+   first-found reversed witness would only give colexicographic order.
+4. If the probe is inconclusive, run the ordinary forward subset-product BFS
+   with the remaining global budget. `overlap`, `empty`, and `match` use the
+   same paths as `automata`.
+
+**Strengths**
+
+- Solves suffix-window families that are exponential in the forward direction
+  but compact after reversal.
+- Preserves exact verdict and witness semantics.
+- Leaves the historical `automata` cost model untouched unless explicitly
+  selected with `--backend reversal`.
+
+**Weaknesses**
+
+- Not an independent decision procedure; it is a search-direction heuristic
+  around the same automata engine.
+- Inputs hard in both directions can still explore exponential subset
+  structure after the bounded probe falls back.
+- The reverse probe currently targets only `includes`/`equivalent`.
+
+**When to use**
+
+Suffix/window-heavy inclusion and equivalence checks, especially when forward
+`automata` reaches a resource limit.
+
+---
+
+## 3. `minimized` — determinize, minimize, then decide
 
 **Pipeline**
 
@@ -106,7 +165,7 @@ that minimize well (long `a+a+…` chains, optional chains, factorable stars).
 
 ---
 
-## 3. `derivatives` — Brzozowski residual product
+## 4. `derivatives` — Brzozowski residual product
 
 **Pipeline**
 
@@ -149,7 +208,7 @@ the same atom; experiments comparing residual size to NFA subset size
 
 ---
 
-## 4. `antimirov` — partial derivatives (linear forms)
+## 5. `antimirov` — partial derivatives (linear forms)
 
 **Pipeline**
 
@@ -204,7 +263,7 @@ alternation where residual *sets* stay narrow; research comparisons on the
 
 ---
 
-## 5. `antichain` — antichain inclusion / NFA-state product
+## 6. `antichain` — antichain inclusion / NFA-state product
 
 Fifth independent engine (De Wulf et al., CAV'06). Unlike the other four,
 `A` and `B` are *not* explored symmetrically as subsets on both sides.
@@ -268,7 +327,7 @@ and `equivalent` verdicts independently of every subset-based engine.
 
 ---
 
-## 6. `hkc` — bisimulation up to congruence
+## 7. `hkc` — bisimulation up to congruence
 
 Bonchi & Pous, POPL'13. `A` and `B` are combined into one NFA over a shared,
 disjoint state space (`A`'s own states, then `B`'s, offset); the search
@@ -346,7 +405,7 @@ suspect have redundant structure worth testing.
 
 ---
 
-## 7. `abstraction` — CEGAR common-subexpression reduction
+## 8. `abstraction` — CEGAR common-subexpression reduction
 
 **Pipeline**
 
@@ -515,8 +574,9 @@ let backend = AbstractionBackend::with_inner_and_budget(DerivativeBackend, 12);
 
 ```text
 small / unknown shape     →  automata (default)
+suffix/window direction   →  reversal
 equivalence of "same-ish" →  minimized
-equivalence, suspect redundant structure → hkc (cross-check; not a speed win — see §6)
+equivalence, suspect redundant structure → hkc (cross-check; not a speed win — see §7)
 star / optional chains    →  derivatives  (and compare)
 nth-from-end / windows    →  try antichain first; still may UNKNOWN on very large windows
 agreement testing         →  run all six independent engines, require identical verdicts
@@ -528,6 +588,7 @@ large shared block        →  abstraction (inner defaults to automata;
 
 ```bash
 ./target/release/regexrel --backend automata    --stats equivalent 'a+' 'aa*'
+./target/release/regexrel --backend reversal    --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend minimized   --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend derivatives --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend abstraction --abstraction-inner derivatives --stats equivalent 'a+' 'aa*'
@@ -557,6 +618,6 @@ return `LIMIT` (`UNKNOWN`) under practical bounds:
 Promising directions: suffix transducers / ring-buffer abstractions, a
 simulation preorder (Abdulla et al.) on top of the existing `antichain`
 backend's plain subset subsumption (noted as a planned follow-up in
-`antichain.rs`'s own tests — see §5), symbolic (BDD) windows, and
+`antichain.rs`'s own tests — see §6), symbolic (BDD) windows, and
 decomposition of regular constraints into independent projections before
 product.

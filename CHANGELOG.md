@@ -4,8 +4,23 @@ All notable changes are documented here.
 
 ## Unreleased
 
-- Added: automatic bounded language-reversal probing to the default `automata`
-  backend for `includes` and `equivalent`. The probe reverses NFA edges and
+- Added: general-purpose backend orientation via
+  `--orientation forward|reversed|auto` (default `forward`). `reversed` transforms both the
+  parsed AST and compiled NFA before dispatch, so the same language reversal
+  can wrap `automata`, `minimized`, `derivatives`, `antimirov`, `antichain`,
+  `hkc`, or `abstraction`; witnesses are mapped back and replay-validated on
+  the original languages. `auto` gives forward and reversed binary probes 5%
+  of the state/time budget each (capped at 512 states / 50 ms), returns any
+  definitive probe immediately, otherwise continues in the cheaper direction
+  with the remaining global budget. The configured orientation policy is
+  reported in JSON as `backend.orientation`. Added public `Orientation` and
+  `OrientedBackend` library APIs. The pre-existing `--backend reversal` is
+  retained for compatibility; plain `--backend automata` remains forward-only
+  unless an orientation is explicitly selected.
+
+- Added: explicit `reversal` backend with bounded language-reversal probing
+  for `includes` and `equivalent`. The default `automata` backend remains the
+  historical forward-only subset-product search. The reversal probe reverses NFA edges and
   swaps start/accept states, using at most 10% of the configured state/time
   budget (capped at 512 product states and 50 ms) before falling back to the
   existing forward subset product with the remaining global budget. This
@@ -18,7 +33,7 @@ All notable changes are documented here.
   regressions for that lexical tie case and for the `nth28` hard-family shape.
 
 - Added: `hkc` backend (`src/hkc.rs`) — bisimulation up to congruence
-  (Bonchi & Pous, POPL'13), the seventh backend and sixth independent
+  (Bonchi & Pous, POPL'13), an independent
   `RelationBackend`. `equivalent` runs the technique directly over a
   combined `A ⊔ B` NFA (disjoint address space, `A`'s states then `B`'s
   offset) without determinizing either side; `includes` reduces to the

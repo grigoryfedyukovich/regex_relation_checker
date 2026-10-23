@@ -5,21 +5,34 @@ regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
 a relation fails or overlap succeeds, it emits a **shortest** constructive
 witness.
 
-Seven interchangeable analysis engines implement the same contract:
+Eight interchangeable analysis engines implement the same contract:
 
 | `--backend` | Technique |
 |-------------|-----------|
 | `automata` (default) | On-the-fly NFA subset product BFS |
+| `reversal` | Bounded reverse-language probe, then forward automata fallback |
 | `minimized` | Determinize → minimize → isomorphism or DFA product |
 | `derivatives` | Brzozowski residuals + residual-pair product |
 | `antimirov` | Antimirov partial derivatives (linear forms) + product BFS |
 | `antichain` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
 | `hkc` | Bisimulation up to congruence over a combined NFA (no determinization) |
-| `abstraction` | Common-subexpression abstraction + CEGAR, wrapping any of the above |
+| `abstraction` | Common-subexpression abstraction + CEGAR over a configurable inner backend |
 
 Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
-state or time limit yields **`UNKNOWN`**, never a guessed verdict. Details:
-[docs/backends.md](docs/backends.md), [SPEC.md](SPEC.md).
+state or time limit yields **`UNKNOWN`**, never a guessed verdict. Search
+direction is orthogonal to the backend via `--orientation`:
+
+| `--orientation` | Behavior |
+|-----------------|----------|
+| `forward` (default) | Historical behavior; analyze languages as written |
+| `reversed` | Reverse the regular language(s), run the selected backend, then map witnesses back |
+| `auto` | For binary relations, probe forward and reversed directions, then continue in the cheaper one |
+
+This works with every backend, including `derivatives`, `antimirov`,
+`minimized`, `antichain`, `hkc`, and `abstraction`. The older
+`--backend reversal` remains as the specialized automata-only compatibility
+mode with its bounded reverse probe. Details: [docs/backends.md](docs/backends.md),
+[SPEC.md](SPEC.md).
 
 ## Two-minute demo
 
@@ -46,7 +59,9 @@ regexrel syntax
 regexrel --json equivalent '^a+$' 'aa*'
 regexrel --stats --backend minimized --max-states 50000 overlap 'a.*z' 'ab+z'
 regexrel --backend derivatives equivalent 'a*a*a*' 'a*'
-regexrel --backend abstraction --stats equivalent '((a|b){25}c){10}x' '((a|b){25}c){10}x'
+regexrel --backend derivatives --orientation reversed equivalent 'ab|ac' 'a(b|c)'
+regexrel --backend automata --orientation auto --stats equivalent '(a|b)*a(a|b){28}x' '(a|b)*a(a|b){28}y'
+regexrel --backend abstraction --orientation auto --stats equivalent '((a|b){25}c){10}x' '((a|b){25}c){10}x'
 regexrel --draw nfa 'a+b'
 regexrel --draw dfa --output dfa.pdf '(a|b)*a'
 regexrel --draw minimized --emit-dot '[ab]+'
@@ -56,11 +71,40 @@ regexrel --draw minimized --emit-dot '[ab]+'
 
 ### `automata` (default)
 
-Thompson ε-NFAs with on-the-fly subset-product BFS. For `includes` and
-`equivalent`, the backend first spends a small bounded probe on the reversed
-languages; suffix-window expressions that are exponential left-to-right often
-collapse there. If the probe does not decide the query, the ordinary forward
-search gets the remaining budget. No upfront determinization cost.
+Thompson ε-NFAs with the historical forward-only on-the-fly subset-product
+BFS. No upfront determinization cost and no implicit reversal probe. Add
+`--orientation reversed` or `--orientation auto` explicitly when desired.
+
+### `reversal`
+
+The same automata engine with an explicit bounded reverse-language probe for
+`includes` and `equivalent`. Suffix-window expressions that are exponential
+left-to-right often collapse after reversal. If the probe does not decide the
+query, the ordinary forward search gets the remaining budget. Use this backend
+when that directional heuristic is desired; it is never enabled implicitly by
+the default `automata` backend.
+
+### General `--orientation` layer
+
+`--orientation reversed` is a semantics-preserving preprocessor around the
+selected backend rather than an automata-only trick. It reverses concatenation
+recursively in the parsed AST and reverses NFA edges/start/accept roles, so
+AST engines and NFA engines receive the same reversed language. A returned
+witness is reversed back before replay validation.
+
+`--orientation auto` is binary-query only: it spends at most 5% of the
+configured state/time budget in a small forward probe and another 5% in a
+reversed probe (each capped at 512 states / 50 ms). A definitive probe result
+is returned immediately; otherwise the remaining global budget is spent in
+the cheaper direction. Exact ties prefer forward. `empty` and `match` stay
+forward under `auto`; explicit `reversed` still applies to them.
+
+The `automata` backend exposes an exact reverse-search hook that preserves the
+original shortest-then-lowest-scalar witness tie-break. Other backends receive
+the general transformation and preserve witness length; because their native
+search orders are defined in the transformed direction, reversing a tied
+witness can change which same-length witness is selected. Verdicts remain
+exact and every witness is replay-validated against the original languages.
 
 ### `minimized`
 
@@ -114,7 +158,7 @@ faster default.
 ### `abstraction`
 
 Common-subexpression abstraction with counterexample-guided refinement
-(CEGAR), wrapping one of the six engines above rather than replacing them.
+(CEGAR), wrapping a configurable concrete engine rather than replacing it.
 Subexpressions shared *verbatim* by both patterns are replaced with a fresh
 marker symbol before the inner engine runs, shrinking the pattern the inner
 engine actually has to search. A resulting `YES` is validated by expanding
@@ -132,11 +176,11 @@ large block:
 # states: left=1544, right=1544, product=2 / 100000; ...
 ```
 
-versus 512 product states for the same query under `automata`. See
+versus a much larger product search for the same query under `automata`. See
 [bench/yes/mega_cegar_overlap__shared-core.md](bench/yes/mega_cegar_overlap__shared-core.md)
 and the sibling `mega_cegar_*` files for the measured comparison.
 
-`--abstraction-inner <automata|minimized|derivatives|antimirov|antichain>`
+`--abstraction-inner <automata|minimized|derivatives|antimirov|antichain|hkc>`
 picks which engine `abstraction` runs for each CEGAR round and for the
 concrete fall-back (default `automata`, matching `abstraction`'s historical
 behaviour). It's ignored by every other `--backend` value:
@@ -149,7 +193,7 @@ behaviour). It's ignored by every other `--backend` value:
 Compare engines on the same input:
 
 ```bash
-for b in automata minimized derivatives antimirov antichain hkc abstraction; do
+for b in automata reversal minimized derivatives antimirov antichain hkc abstraction; do
   echo "== $b =="
   ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
 done
@@ -328,6 +372,25 @@ let report = analyze_binary_with_backend(
 
 `AbstractionBackend::new()` is a convenience shorthand for
 `AbstractionBackend::with_inner(AutomataBackend)`.
+
+Orientation is also available in the library as a generic wrapper:
+
+```rust
+use regexrel::{
+    analyze_binary_with_backend, DerivativeBackend, Config, Orientation,
+    OrientedBackend, Query,
+};
+
+let backend = OrientedBackend::new(&DerivativeBackend, Orientation::Reversed);
+let report = analyze_binary_with_backend(
+    Query::Equivalent,
+    "ab|ac",
+    "a(b|c)",
+    &Config::default(),
+    &backend,
+)?;
+# Ok::<(), regexrel::AnalyzeError>(())
+```
 
 ## Development
 

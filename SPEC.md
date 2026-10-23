@@ -32,17 +32,48 @@ and configuration.
 
 ## 3. Analysis backends
 
-Seven engines implement the same contract (`RelationBackend`). Select with
+Eight engines implement the same contract (`RelationBackend`). Select with
 `--backend`. Completed `YES`/`NO` results must agree across backends; see
 [docs/backends.md](docs/backends.md).
 
-### 3.1 `automata` (default)
+### 3.1 Orientation layer
+
+Search direction is independent of the selected backend via
+`--orientation forward|reversed|auto` (default `forward`). `reversed` reverses
+the regular-language AST (concatenation order recursively; outer `^`/`$` swap)
+and the compiled NFA before calling the selected backend, then maps any witness
+back to the original direction. Therefore the transformation applies equally
+to NFA-based and AST/residual-based engines.
+
+For binary queries, `auto` first runs a forward probe and, if inconclusive, a
+reversed probe. Each probe gets 5% of the caller's state/time budget, capped at
+512 states and 50 ms. A definitive probe result is returned immediately;
+otherwise both probe costs are subtracted and the backend continues with the
+remaining budget in the lower-cost direction (ties choose forward). `empty`
+and `match` stay forward under `auto`; explicit `reversed` still applies.
+
+`automata` implements a specialized reverse-search hook that reconstructs from
+the full shortest-path DAG and therefore preserves the original lexical
+tie-break. Other backends expose only their final witness; reversal preserves
+shortest codepoint length but may select a different same-length witness after
+mapping back. Reports expose the active mode as `backend.orientation` and use
+`semantics.witness_order` to distinguish the two contracts.
+
+### 3.2 `automata` (default)
 
 On-the-fly subset construction and a product BFS over pairs of NFA subsets.
 No upfront determinization. Symbolic transitions use charset partitions;
 lowest-codepoint representatives yield deterministic shortest witnesses.
 
-### 3.2 `minimized`
+### 3.3 `reversal`
+
+Runs a bounded product probe on the reversed languages for `includes` and
+`equivalent`, then falls back to the same forward subset-product search as
+`automata` with the remaining global budget. Reversal is opt-in: selecting
+`automata` never runs this probe. `overlap`, `empty`, and concrete `match`
+use the same paths as `automata`.
+
+### 3.4 `minimized`
 
 1. Determinize each pattern to a DFA.  
 2. Minimize (Moore partition refinement).  
@@ -51,21 +82,21 @@ lowest-codepoint representatives yield deterministic shortest witnesses.
 4. Otherwise product-search the minimized DFAs (overlap, includes, empty, or
    non-isomorphic equivalence).
 
-### 3.3 `derivatives`
+### 3.5 `derivatives`
 
 Brzozowski residual expressions with normalization (empty/epsilon elimination,
 sorted deduplicated alternations, flattened concatenations). Product BFS over
 pairs of residuals; nullability decides acceptance. Counted repetition is
 expanded before derivation.
 
-### 3.4 `antimirov`
+### 3.6 `antimirov`
 
 Antimirov partial derivatives: each character produces a finite set of
 residuals (linear form). Product BFS over pairs of linear forms; a form
 accepts when any member is nullable. Language-equivalent residual theory to
 Brzozowski with a set-shaped state key.
 
-### 3.5 `antichain`
+### 3.7 `antichain`
 
 Antichain inclusion (De Wulf et al., CAV'06). `A` is explored as individual
 NFA states; `B` is tracked as a subset, pruned by subsumption against a
@@ -74,7 +105,7 @@ minimal antichain of previously-seen `(state, subset)` pairs. `overlap` and
 `includes` runs the antichain search directly; `equivalent` runs both
 directional inclusions, interleaved. Independent decision procedure.
 
-### 3.6 `hkc`
+### 3.8 `hkc`
 
 Bisimulation up to congruence (Bonchi & Pous, POPL'13). `A` and `B` are
 combined into one NFA over a shared, disjoint state space; the search
@@ -93,7 +124,7 @@ backends). Ships with the paper's *naive* congruence-closure check — see
 reproduce the technique's headline speedups against `minimized` on this
 project's hard suite.
 
-### 3.7 `abstraction`
+### 3.9 `abstraction`
 
 Common-subexpression CEGAR reduction. Subexpressions occurring structurally
 identically in both patterns are replaced by a shared fresh marker symbol;
@@ -104,12 +135,12 @@ every marker in the witness expanded back to a real substring) is returned
 directly. An abstract `NO`/`UNKNOWN` triggers counterexample-guided
 refinement, bounded by `MAX_REFINEMENT_ROUNDS`, after which analysis falls
 back to the inner engine on the original, unabstracted patterns. Unlike
-backends 3.1–3.6, this is not an independent decision procedure — it
+concrete backends 3.2–3.8, this is not an independent decision procedure — it
 delegates to whichever inner engine is configured — but every internal
 round shares one `timeout_ms` budget, and every Overlap witness is expanded
 and independently replay-validated before it can reach the caller (§5).
 
-### 3.8 Limits
+### 3.10 Limits
 
 `max_product_states` (`--max-states`) and `timeout_ms` (`--timeout-ms`) bound
 all backends. Exhausting either yields `UNKNOWN`.
@@ -137,8 +168,11 @@ Run `regexrel syntax` for the installed contract text.
 - Default alphabet ASCII `U+0000..U+007F`; `--alphabet unicode` expands to
   scalar values excluding surrogates.  
 - In v0.1.x, `\d` `\w` `\s` remain ASCII-defined in both alphabet modes.  
-- Witnesses: BFS shortest by codepoint length; ties broken by lowest scalar in
-  each symbolic partition.  
+- Witnesses are shortest by codepoint length. In forward orientation (and the
+  automata reverse hook), ties are broken by lowest scalar in each symbolic
+  partition. Generic reversed/auto wrappers around other backends may choose a
+  different deterministic same-length witness after mapping back; this is
+  reported in `semantics.witness_order`.  
 - Every returned witness is replayed on both automata before emission.
 
 Full detail: [docs/semantics.md](docs/semantics.md).
@@ -157,6 +191,9 @@ validate. Unknown TOML keys are errors.
 | `dot_matches_newline` | `--dot-matches-newline` | `false` | `.` includes newline |
 | `ci_exit_code` | `--ci-exit-code` | `10` | exit when `--fail-on` trips |
 
+`--orientation` is a CLI/library execution policy rather than a TOML semantic
+configuration key; its default is `forward`.
+
 ## 7. CLI surface
 
 ```text
@@ -173,7 +210,7 @@ uses the Thompson construction, `dfa` the existing subset construction, and
 `minimized` Moore minimization. `--output PATH` selects the file (default
 `<kind>.pdf`); `--emit-dot` prints Graphviz source instead of invoking `dot`.
 
-Global options include `--backend`, `--json`, `--stats`, `--print-config`,
+Global options include `--backend`, `--orientation`, `--json`, `--stats`, `--print-config`,
 `--fail-on`, `--draw`, `--output`, `--emit-dot`, and the configuration flags
 above.
 
@@ -219,6 +256,9 @@ assert_eq!(report.verdict, Verdict::Yes);
 
 Backend-specific entry points: `analyze_binary_with_backend`,
 `analyze_empty_with_backend`.
+
+`Orientation` and `OrientedBackend` expose the same direction layer to library
+callers, e.g. `OrientedBackend::new(&DerivativeBackend, Orientation::Auto)`.
 
 ## 10. Correctness boundary
 

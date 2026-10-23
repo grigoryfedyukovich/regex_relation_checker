@@ -62,7 +62,9 @@ it as a literal brace the person probably didn't intend.
 
 ## Witness ordering
 
-The search uses BFS over deterministic subset/product states. Consequently, a returned witness has minimum codepoint length. Symbolic transition intervals are partitioned at every relevant endpoint. The lowest scalar representative of each partition is explored first, making output deterministic.
+The forward search uses BFS over deterministic subset/product states. Consequently, a returned witness has minimum codepoint length. Symbolic transition intervals are partitioned at every relevant endpoint. The lowest scalar representative of each partition is explored first, making output deterministic.
+
+`--orientation reversed` preserves minimum witness length and maps a witness back to the original string direction. The automata backend has a specialized reverse-search hook that also preserves the original lowest-scalar tie-break. Other backends may choose a different witness among equal-length counterexamples after reversal; JSON reports that weaker contract as `shortest_codepoint_length_then_orientation_specific_tie_break`. `--orientation auto` reports the canonical tie-break only when the selected backend preserves it in both directions.
 
 This tie-breaking rule is not intended to produce printable text. JSON output correctly escapes control characters.
 
