@@ -136,8 +136,8 @@ enum OrientationArg {
     Forward,
     /// Reverse the language(s) before invoking the selected backend.
     Reversed,
-    /// Probe both directions for binary relations, then continue with the
-    /// direction that appears cheaper. Unary queries stay forward.
+    /// Probe both directions for binary relations, then adaptively continue
+    /// only when one direction is materially cheaper. Unary queries stay forward.
     Auto,
 }
 
@@ -783,6 +783,27 @@ fn render_text(report: &Report, show_stats: bool) -> String {
             report.statistics.generated_transitions,
             report.statistics.timeout_ms,
         ));
+        if let Some(selection) = &report.backend.orientation_selection {
+            let reversed = selection
+                .reversed
+                .as_ref()
+                .map(|probe| {
+                    format!(
+                        "reversed(cost={}, states={}, transitions={})",
+                        probe.projected_cost, probe.visited_states, probe.generated_transitions
+                    )
+                })
+                .unwrap_or_else(|| "reversed(not-run)".to_owned());
+            lines.push(format!(
+                "orientation: selected={}, reason={}; forward(cost={}, states={}, transitions={}); {}",
+                selection.selected,
+                selection.reason,
+                selection.forward.projected_cost,
+                selection.forward.visited_states,
+                selection.forward.generated_transitions,
+                reversed,
+            ));
+        }
         lines.push(TIMING_PLACEHOLDER.to_owned());
     }
     lines.push(String::new());

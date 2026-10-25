@@ -239,6 +239,57 @@ fn orientation_is_orthogonal_to_backend_selection() {
 }
 
 #[test]
+fn auto_orientation_reports_selection_telemetry() {
+    let output = Command::cargo_bin("regexrel")
+        .unwrap()
+        .args([
+            "--backend",
+            "automata",
+            "--orientation",
+            "auto",
+            "--json",
+            "equivalent",
+            "a(b|c)",
+            "ab|ac",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let selection = &report["backend"]["orientation_selection"];
+    assert_eq!(selection["selector"].as_str(), Some("adaptive-v1"));
+    assert_eq!(selection["selected"].as_str(), Some("forward"));
+    assert_eq!(
+        selection["reason"].as_str(),
+        Some("forward_probe_definitive")
+    );
+    assert!(selection["forward"]["projected_cost"].as_u64().is_some());
+    assert!(selection.get("reversed").is_none());
+}
+
+#[test]
+fn auto_stats_explain_orientation_choice() {
+    Command::cargo_bin("regexrel")
+        .unwrap()
+        .args([
+            "--orientation",
+            "auto",
+            "--stats",
+            "equivalent",
+            "a(b|c)",
+            "ab|ac",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("orientation: selected=forward")
+                .and(predicate::str::contains("forward(cost="))
+                .and(predicate::str::contains("reversed(not-run)")),
+        );
+}
+
+#[test]
 fn stats_add_automata_and_timing_lines() {
     Command::cargo_bin("regexrel")
         .unwrap()

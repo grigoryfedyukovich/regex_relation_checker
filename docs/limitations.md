@@ -19,7 +19,12 @@ lexicographic tie-break. Other backends currently expose only their final
 witness, not their equal-depth predecessor structure, so a reversed tied
 witness can differ from the forward canonical same-length witness after it is
 mapped back. This affects deterministic witness tie selection only, never the
-verdict or witness validity.
+verdict or witness validity. `--orientation auto` is a performance heuristic:
+its 5% probes estimate continuation cost from budget pressure, transition
+fanout, and start-frontier complexity, with a 20% hysteresis favoring forward.
+A misprediction can waste time or states but cannot change a completed verdict;
+explicit `forward`/`reversed` remain available for reproducible direction choice.
+
 `abstraction` is another special case: it delegates to a configurable inner
 engine rather than being an independent decision procedure, so it is
 not currently exercised by the `tests/backend_agreement.rs` differential

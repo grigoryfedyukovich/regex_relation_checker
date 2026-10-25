@@ -11,8 +11,11 @@ All notable changes are documented here.
   `hkc`, or `abstraction`; witnesses are mapped back and replay-validated on
   the original languages. `auto` gives forward and reversed binary probes 5%
   of the state/time budget each (capped at 512 states / 50 ms), returns any
-  definitive probe immediately, otherwise continues in the cheaper direction
-  with the remaining global budget. The configured orientation policy is
+  definitive probe immediately, otherwise estimates continuation cost from
+  budget pressure, transitions-per-state, and start-frontier complexity. A
+  20% hysteresis keeps near-ties forward; probe work remains inside the global
+  budget. JSON/`--stats` now expose the selected direction, decision reason,
+  and per-direction probe metrics. The configured orientation policy is
   reported in JSON as `backend.orientation`. Added public `Orientation` and
   `OrientedBackend` library APIs. The pre-existing `--backend reversal` is
   retained for compatibility; plain `--backend automata` remains forward-only

@@ -6,12 +6,28 @@ Required top-level fields:
 
 - `schema_version`: machine-readable contract version
 - `tool_version`: crate version
-- `backend`: backend name, version, and orientation (`forward`, `reversed`, or `auto`)
+- `backend`: backend name, version, orientation (`forward`, `reversed`, or `auto`), and optional adaptive-orientation selection telemetry
 - `query`: `empty`, `overlap`, `includes`, or `equivalent`
 - `verdict`: `YES`, `NO`, `UNKNOWN`, or `UNSUPPORTED`
 - `diagnostic`: stable ID, message, optional frontend error, and effective assumptions
 - `statistics`: NFA sizes, visited states, generated symbolic transitions, limits, alphabet, and phase timings
 - `semantics`: full-match, witness-order, shorthand-class, dot, and proof-mode contract
+
+
+When `backend.orientation` is `auto` and a binary analysis reaches the orientation selector,
+`backend.orientation_selection` is present. It contains:
+
+- `selector`: selector/scoring version (currently `adaptive-v1`);
+- `selected`: `forward`, `reversed`, or `none` when the probes themselves exhaust the global budget;
+- `reason`: a stable decision reason such as `forward_probe_definitive`,
+  `reversed_probe_definitive`, or `forward_preferred_by_hysteresis`;
+- `hysteresis_percent`: currently `20`;
+- `forward` and optional `reversed` probe profiles with status, states, transitions,
+  state/time pressure (per mille), transitions-per-state (milli-units), start-frontier
+  complexity, and the integer `projected_cost` used by the selector.
+
+The reversed probe is omitted when the forward probe already decides the query or consumes
+the remaining global budget. These are additive schema-v1 fields.
 
 `witness` is present only when the verdict has constructive evidence. It contains:
 

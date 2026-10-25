@@ -35,4 +35,6 @@ pub use draw::{draw_dot, render_graph, DrawError, DrawKind, DrawResult};
 pub use hkc::HkcBackend;
 pub use minimize::MinimizedBackend;
 pub use parser::{parse, FrontendError, FrontendErrorKind};
-pub use report::{BackendInfo, Report, Verdict, Witness};
+pub use report::{
+    BackendInfo, OrientationProbeStatistics, OrientationSelection, Report, Verdict, Witness,
+};

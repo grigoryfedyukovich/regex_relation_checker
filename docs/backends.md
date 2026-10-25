@@ -24,10 +24,18 @@ than coupling it to the subset-product engine.
 the forward direction 5% of the state/time budget (capped at 512 states /
 50 ms). If that does not decide the query, it gives the reversed direction
 the same probe. If neither is definitive, it subtracts both probes from the
-global budget and continues in the direction with the lower probe cost
-(timeout penalty, then generated transitions, visited states, elapsed time;
-exact ties choose forward). `empty` and concrete `match` stay forward under
-`auto`, while explicit `reversed` applies to both.
+global budget and estimates continuation cost from state/time pressure,
+transitions per visited state, and the orientation-sensitive NFA start-frontier
+subset/branching complexity. Reversal must be at least 20% cheaper by that
+projection; otherwise hysteresis keeps the historical forward direction.
+`--stats` and JSON report the decision and both probe profiles. The scoring
+model is versioned as `adaptive-v1`. Its observed-work term is
+`1000*states + 250*transitions`; budget pressure scales that term up to 2x,
+then transition fanout and start-frontier subset/branch counts add smaller
+structural penalties. State-limit probes get a 1.25x multiplier and timeouts
+2x. A one-sided timeout selects the other direction immediately; otherwise
+reverse must score at most 80% of forward. `empty` and concrete `match` stay
+forward under `auto`, while explicit `reversed` applies to both.
 
 For `automata`, the wrapper uses the dedicated reverse shortest-path DAG so
 the original shortest/lowest-scalar witness order is retained. For other

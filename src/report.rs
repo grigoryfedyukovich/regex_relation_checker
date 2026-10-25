@@ -104,11 +104,40 @@ pub struct Semantics {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct OrientationProbeStatistics {
+    pub status: String,
+    pub visited_states: usize,
+    pub generated_transitions: usize,
+    pub state_budget: usize,
+    pub timeout_ms: u64,
+    pub state_pressure_milli: u32,
+    pub time_pressure_milli: u32,
+    pub transition_fanout_milli: u64,
+    pub start_subset_product: usize,
+    pub start_symbolic_branches: usize,
+    pub projected_cost: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OrientationSelection {
+    pub selector: &'static str,
+    pub selected: String,
+    pub reason: String,
+    pub hysteresis_percent: u8,
+    pub forward: OrientationProbeStatistics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reversed: Option<OrientationProbeStatistics>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct BackendInfo {
     pub name: String,
     pub version: String,
     /// Direction wrapper applied around the selected backend.
     pub orientation: String,
+    /// Present for `auto` after the orientation probes have run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation_selection: Option<OrientationSelection>,
 }
 
 #[derive(Clone, Debug, Serialize)]

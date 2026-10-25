@@ -47,10 +47,23 @@ to NFA-based and AST/residual-based engines.
 
 For binary queries, `auto` first runs a forward probe and, if inconclusive, a
 reversed probe. Each probe gets 5% of the caller's state/time budget, capped at
-512 states and 50 ms. A definitive probe result is returned immediately;
-otherwise both probe costs are subtracted and the backend continues with the
-remaining budget in the lower-cost direction (ties choose forward). `empty`
+512 states and 50 ms. A definitive probe result is returned immediately. If
+both probes are inconclusive, `auto` computes a backend-neutral projected cost
+from state/time budget pressure, transitions per visited state, and the NFA
+start-frontier subset/branching complexity in each orientation. Reversal must
+beat forward by at least 20%; otherwise hysteresis preserves the historical
+forward direction. Probe work is charged to the same global budget. `empty`
 and `match` stay forward under `auto`; explicit `reversed` still applies.
+
+The `adaptive-v1` integer score is deterministic given probe counters:
+`observed = 1000*states + 250*transitions`; `pressure` is the larger of
+state/time budget utilization in per-mille units; and
+`cost = observed*(1000+pressure)/1000 + 64*fanout_milli +
+128*start_subset_product + 256*start_symbolic_branches`. State-limit probes
+receive a 1.25x multiplier, timeout probes a 2x multiplier, and unsupported
+probes are effectively infinite. A timeout on only one side is an immediate
+preference for the other side. Otherwise reverse must have both a strictly
+lower cost and at most 80% of the forward cost.
 
 `automata` implements a specialized reverse-search hook that reconstructs from
 the full shortest-path DAG and therefore preserves the original lexical

@@ -93,11 +93,16 @@ AST engines and NFA engines receive the same reversed language. A returned
 witness is reversed back before replay validation.
 
 `--orientation auto` is binary-query only: it spends at most 5% of the
-configured state/time budget in a small forward probe and another 5% in a
-reversed probe (each capped at 512 states / 50 ms). A definitive probe result
-is returned immediately; otherwise the remaining global budget is spent in
-the cheaper direction. Exact ties prefer forward. `empty` and `match` stay
-forward under `auto`; explicit `reversed` still applies to them.
+configured state/time budget in a small forward probe and, if needed, another
+5% in a reversed probe (each capped at 512 states / 50 ms). A definitive probe
+result is returned immediately. Otherwise it estimates continuation cost from
+state/time pressure, transitions per visited state, and orientation-sensitive
+start-frontier complexity. Reversal is chosen only when its projected cost is
+at least 20% lower; near-ties stay forward. Probe work is charged to the same
+global budget. `--stats` and JSON expose the selected direction, reason, and
+per-direction probe metrics. The scoring model is versioned as `adaptive-v1`.
+`empty` and `match` stay forward under `auto`; explicit `reversed` still applies
+to them.
 
 The `automata` backend exposes an exact reverse-search hook that preserves the
 original shortest-then-lowest-scalar witness tie-break. Other backends receive

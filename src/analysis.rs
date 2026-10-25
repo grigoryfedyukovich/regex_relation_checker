@@ -3,9 +3,11 @@ use crate::config::Config;
 use crate::nfa::Nfa;
 use crate::parser::{parse, FrontendError, FrontendErrorKind};
 use crate::report::{
-    relation, BackendInfo, Diagnostic, Report, Semantics, Statistics, Timings, Verdict, Witness,
+    relation, BackendInfo, Diagnostic, OrientationProbeStatistics, OrientationSelection, Report,
+    Semantics, Statistics, Timings, Verdict, Witness,
 };
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -115,6 +117,11 @@ pub trait RelationBackend {
     /// forward; [`OrientedBackend`] overrides this for reporting.
     fn orientation(&self) -> &'static str {
         "forward"
+    }
+
+    /// Per-query decision telemetry for an adaptive orientation wrapper.
+    fn orientation_selection(&self) -> Option<OrientationSelection> {
+        None
     }
 
     /// Witness-order contract advertised in reports.
@@ -376,15 +383,20 @@ impl RelationBackend for ReversalBackend {
 /// relations and then spends the remaining caller budget in the cheaper
 /// direction. Unary `empty`/`match` use forward mode under `Auto`, because
 /// there is no product-direction blow-up to estimate there.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct OrientedBackend<'a> {
     inner: &'a dyn RelationBackend,
     orientation: Orientation,
+    selection: RefCell<Option<OrientationSelection>>,
 }
 
 impl<'a> OrientedBackend<'a> {
     pub fn new(inner: &'a dyn RelationBackend, orientation: Orientation) -> Self {
-        Self { inner, orientation }
+        Self {
+            inner,
+            orientation,
+            selection: RefCell::new(None),
+        }
     }
 
     pub fn inner(&self) -> &'a dyn RelationBackend {
@@ -393,6 +405,27 @@ impl<'a> OrientedBackend<'a> {
 
     pub fn selected_orientation(&self) -> Orientation {
         self.orientation
+    }
+
+    fn clear_selection(&self) {
+        *self.selection.borrow_mut() = None;
+    }
+
+    fn record_selection(
+        &self,
+        selected: &str,
+        reason: &str,
+        forward: OrientationProbeStatistics,
+        reversed: Option<OrientationProbeStatistics>,
+    ) {
+        *self.selection.borrow_mut() = Some(OrientationSelection {
+            selector: AUTO_SELECTOR_VERSION,
+            selected: selected.to_owned(),
+            reason: reason.to_owned(),
+            hysteresis_percent: AUTO_HYSTERESIS_PERCENT,
+            forward,
+            reversed,
+        });
     }
 
     fn analyze_binary_reversed_nfa(
@@ -450,20 +483,135 @@ fn orientation_probe_config(config: &Config) -> Config {
     probe
 }
 
-fn prefer_reversed_probe(forward: &BackendResult, reversed: &BackendResult) -> bool {
-    // A timeout is a stronger signal of an expensive orientation than merely
-    // filling a small state probe quickly. After that, use generated work,
-    // visited states, then elapsed time. Exact ties deliberately prefer the
-    // historical forward direction.
-    let score = |result: &BackendResult| {
-        (
-            usize::from(u8::from(matches!(result.status, BackendStatus::Timeout))),
-            result.generated_transitions,
-            result.visited_states,
-            result.analysis_ms,
-        )
+const AUTO_SELECTOR_VERSION: &str = "adaptive-v1";
+const AUTO_HYSTERESIS_PERCENT: u8 = 20;
+const AUTO_TRANSITION_WEIGHT: u64 = 250;
+const AUTO_FANOUT_WEIGHT: u64 = 64;
+const AUTO_START_SUBSET_WEIGHT: u64 = 128;
+const AUTO_START_BRANCH_WEIGHT: u64 = 256;
+
+fn backend_status_name(status: BackendStatus) -> &'static str {
+    match status {
+        BackendStatus::Found => "found",
+        BackendStatus::Exhausted => "exhausted",
+        BackendStatus::StateLimit => "state_limit",
+        BackendStatus::Timeout => "timeout",
+        BackendStatus::Unsupported => "unsupported",
+    }
+}
+
+fn ratio_milli(numerator: u128, denominator: u128) -> u32 {
+    if denominator == 0 {
+        return 1_000;
+    }
+    numerator
+        .saturating_mul(1_000)
+        .div_ceil(denominator)
+        .min(1_000) as u32
+}
+
+fn start_complexity(left: &Nfa, right: &Nfa) -> (usize, usize) {
+    let left_start = left.start_subset();
+    let right_start = right.start_subset();
+    let subset_product = left_start.len().saturating_mul(right_start.len());
+    let sets: Vec<&crate::charset::CharSet> = left
+        .outgoing_sets(&left_start)
+        .chain(right.outgoing_sets(&right_start))
+        .collect();
+    let symbolic_branches = representative_chars(&sets).len();
+    (subset_product, symbolic_branches)
+}
+
+fn probe_statistics(
+    result: &BackendResult,
+    probe_config: &Config,
+    left: &Nfa,
+    right: &Nfa,
+) -> OrientationProbeStatistics {
+    let state_pressure_milli = ratio_milli(
+        result.visited_states as u128,
+        probe_config.max_product_states as u128,
+    );
+    let time_pressure_milli = ratio_milli(result.analysis_ms, u128::from(probe_config.timeout_ms));
+    let transition_fanout_milli = if result.visited_states == 0 {
+        0
+    } else {
+        (result.generated_transitions as u64)
+            .saturating_mul(1_000)
+            .div_ceil(result.visited_states as u64)
     };
-    score(reversed) < score(forward)
+    let (start_subset_product, start_symbolic_branches) = start_complexity(left, right);
+
+    // A deliberately simple, backend-neutral projection. The first term is
+    // observed search work; the remaining terms penalize a probe that is
+    // saturating its budget, has high transitions-per-state, or starts from a
+    // structurally broad frontier. Status multipliers distinguish a hard
+    // timeout from an ordinary state-cap stop without trusting wall time as
+    // the primary signal (wall time is noisy at sub-50ms scales).
+    let observed = (result.visited_states as u64)
+        .saturating_mul(1_000)
+        .saturating_add(
+            (result.generated_transitions as u64).saturating_mul(AUTO_TRANSITION_WEIGHT),
+        );
+    let pressure = u64::from(state_pressure_milli.max(time_pressure_milli));
+    let mut projected_cost = observed
+        .saturating_mul(1_000 + pressure)
+        .saturating_div(1_000)
+        .saturating_add(transition_fanout_milli.saturating_mul(AUTO_FANOUT_WEIGHT))
+        .saturating_add((start_subset_product as u64).saturating_mul(AUTO_START_SUBSET_WEIGHT))
+        .saturating_add((start_symbolic_branches as u64).saturating_mul(AUTO_START_BRANCH_WEIGHT));
+    projected_cost = match result.status {
+        BackendStatus::Timeout => projected_cost.saturating_mul(2),
+        BackendStatus::StateLimit => projected_cost.saturating_mul(5).saturating_div(4),
+        BackendStatus::Unsupported => u64::MAX / 4,
+        BackendStatus::Found | BackendStatus::Exhausted => projected_cost,
+    };
+
+    OrientationProbeStatistics {
+        status: backend_status_name(result.status).to_owned(),
+        visited_states: result.visited_states,
+        generated_transitions: result.generated_transitions,
+        state_budget: probe_config.max_product_states,
+        timeout_ms: probe_config.timeout_ms,
+        state_pressure_milli,
+        time_pressure_milli,
+        transition_fanout_milli,
+        start_subset_product,
+        start_symbolic_branches,
+        projected_cost,
+    }
+}
+
+fn choose_auto_orientation(
+    forward: &OrientationProbeStatistics,
+    reversed: &OrientationProbeStatistics,
+) -> (bool, &'static str) {
+    if forward.status == "unsupported" && reversed.status != "unsupported" {
+        return (true, "forward_probe_unsupported");
+    }
+    if reversed.status == "unsupported" {
+        return (false, "reversed_probe_unsupported");
+    }
+    if forward.status == "timeout" && reversed.status != "timeout" {
+        return (true, "forward_probe_timed_out");
+    }
+    if reversed.status == "timeout" && forward.status != "timeout" {
+        return (false, "reversed_probe_timed_out");
+    }
+
+    // Reversal must beat forward by at least 20%. This hysteresis prevents
+    // small timing/noise differences from changing orientation on easy or
+    // near-symmetric inputs. Exact and near ties preserve historical forward
+    // behavior.
+    let reverse_is_materially_cheaper = reversed.projected_cost < forward.projected_cost
+        && u128::from(reversed.projected_cost).saturating_mul(100)
+            <= u128::from(forward.projected_cost)
+                .saturating_mul(100 - u128::from(AUTO_HYSTERESIS_PERCENT));
+    if reverse_is_materially_cheaper {
+        (true, "reversed_projected_cost_materially_lower")
+    } else {
+        (false, "forward_preferred_by_hysteresis")
+    }
 }
 
 fn add_attempt_work(result: &mut BackendResult, earlier: &[&BackendResult], started: Instant) {
@@ -522,6 +670,10 @@ impl RelationBackend for OrientedBackend<'_> {
         }
     }
 
+    fn orientation_selection(&self) -> Option<OrientationSelection> {
+        self.selection.borrow().clone()
+    }
+
     fn witness_order(&self) -> &'static str {
         match self.orientation {
             Orientation::Forward => self.inner.witness_order(),
@@ -550,6 +702,9 @@ impl RelationBackend for OrientedBackend<'_> {
     }
 
     fn analyze_empty(&self, nfa: &Nfa, config: &Config) -> BackendResult {
+        if self.orientation == Orientation::Auto {
+            self.clear_selection();
+        }
         match self.orientation {
             Orientation::Reversed => {
                 let reversed = nfa.reversed();
@@ -587,6 +742,9 @@ impl RelationBackend for OrientedBackend<'_> {
         nfa: &Nfa,
         config: &Config,
     ) -> BackendResult {
+        if self.orientation == Orientation::Auto {
+            self.clear_selection();
+        }
         match self.orientation {
             Orientation::Reversed => {
                 let reversed_expr = expr.reversed();
@@ -610,6 +768,9 @@ impl RelationBackend for OrientedBackend<'_> {
         input: &str,
         config: &Config,
     ) -> BackendResult {
+        if self.orientation == Orientation::Auto {
+            self.clear_selection();
+        }
         match self.orientation {
             Orientation::Reversed => {
                 let reversed_expr = expr.reversed();
@@ -666,16 +827,37 @@ impl OrientedBackend<'_> {
         right: &Nfa,
         config: &Config,
     ) -> BackendResult {
+        self.clear_selection();
         let started = Instant::now();
         let probe_config = orientation_probe_config(config);
         let forward = self.inner.analyze_binary(query, left, right, &probe_config);
+        let forward_stats = probe_statistics(&forward, &probe_config, left, right);
         if is_definitive(forward.status) {
+            self.record_selection("forward", "forward_probe_definitive", forward_stats, None);
             let mut result = forward;
             result.analysis_ms = started
                 .elapsed()
                 .as_millis()
                 .saturating_sub(result.witness_extraction_ms);
             return result;
+        }
+        if started.elapsed().as_millis() >= u128::from(config.timeout_ms) {
+            self.record_selection(
+                "none",
+                "forward_probe_exhausted_global_time_budget",
+                forward_stats,
+                None,
+            );
+            return forward;
+        }
+        if forward.visited_states >= config.max_product_states {
+            self.record_selection(
+                "none",
+                "forward_probe_exhausted_global_state_budget",
+                forward_stats,
+                None,
+            );
+            return forward;
         }
 
         let reversed_left = left.reversed();
@@ -693,7 +875,15 @@ impl OrientedBackend<'_> {
                 &probe_config,
             ))
         };
+        let reversed_stats =
+            probe_statistics(&reversed, &probe_config, &reversed_left, &reversed_right);
         if is_definitive(reversed.status) {
+            self.record_selection(
+                "reversed",
+                "reversed_probe_definitive",
+                forward_stats,
+                Some(reversed_stats),
+            );
             let mut result = reversed;
             add_attempt_work(&mut result, &[&forward], started);
             return result;
@@ -708,6 +898,8 @@ impl OrientedBackend<'_> {
             config,
             forward,
             reversed,
+            forward_stats,
+            reversed_stats,
             started,
         )
     }
@@ -723,10 +915,18 @@ impl OrientedBackend<'_> {
         config: &Config,
         forward: BackendResult,
         reversed: BackendResult,
+        forward_stats: OrientationProbeStatistics,
+        reversed_stats: OrientationProbeStatistics,
         started: Instant,
     ) -> BackendResult {
         let elapsed_ms = started.elapsed().as_millis();
         if elapsed_ms >= u128::from(config.timeout_ms) {
+            self.record_selection(
+                "none",
+                "probe_time_budget_exhausted",
+                forward_stats,
+                Some(reversed_stats),
+            );
             return stopped_after_orientation_probes(
                 BackendStatus::Timeout,
                 &forward,
@@ -739,6 +939,12 @@ impl OrientedBackend<'_> {
             .saturating_add(reversed.visited_states);
         let remaining_states = config.max_product_states.saturating_sub(used_states);
         if remaining_states == 0 {
+            self.record_selection(
+                "none",
+                "probe_state_budget_exhausted",
+                forward_stats,
+                Some(reversed_stats),
+            );
             return stopped_after_orientation_probes(
                 BackendStatus::StateLimit,
                 &forward,
@@ -752,7 +958,17 @@ impl OrientedBackend<'_> {
             (u128::from(config.timeout_ms) - elapsed_ms).min(u128::from(u64::MAX)) as u64;
         remaining.timeout_ms = remaining.timeout_ms.max(1);
 
-        let choose_reversed = prefer_reversed_probe(&forward, &reversed);
+        let (choose_reversed, reason) = choose_auto_orientation(&forward_stats, &reversed_stats);
+        self.record_selection(
+            if choose_reversed {
+                "reversed"
+            } else {
+                "forward"
+            },
+            reason,
+            forward_stats,
+            Some(reversed_stats),
+        );
         let mut result = if choose_reversed {
             if let Some(result) = self
                 .inner
@@ -783,6 +999,7 @@ impl OrientedBackend<'_> {
         right: &Nfa,
         config: &Config,
     ) -> BackendResult {
+        self.clear_selection();
         let started = Instant::now();
         let probe_config = orientation_probe_config(config);
         let forward = self.inner.analyze_binary_expr(
@@ -793,13 +1010,33 @@ impl OrientedBackend<'_> {
             right,
             &probe_config,
         );
+        let forward_stats = probe_statistics(&forward, &probe_config, left, right);
         if is_definitive(forward.status) {
+            self.record_selection("forward", "forward_probe_definitive", forward_stats, None);
             let mut result = forward;
             result.analysis_ms = started
                 .elapsed()
                 .as_millis()
                 .saturating_sub(result.witness_extraction_ms);
             return result;
+        }
+        if started.elapsed().as_millis() >= u128::from(config.timeout_ms) {
+            self.record_selection(
+                "none",
+                "forward_probe_exhausted_global_time_budget",
+                forward_stats,
+                None,
+            );
+            return forward;
+        }
+        if forward.visited_states >= config.max_product_states {
+            self.record_selection(
+                "none",
+                "forward_probe_exhausted_global_state_budget",
+                forward_stats,
+                None,
+            );
+            return forward;
         }
 
         let reversed_left_expr = left_expr.reversed();
@@ -821,7 +1058,15 @@ impl OrientedBackend<'_> {
                 &probe_config,
             ))
         };
+        let reversed_stats =
+            probe_statistics(&reversed, &probe_config, &reversed_left, &reversed_right);
         if is_definitive(reversed.status) {
+            self.record_selection(
+                "reversed",
+                "reversed_probe_definitive",
+                forward_stats,
+                Some(reversed_stats),
+            );
             let mut result = reversed;
             add_attempt_work(&mut result, &[&forward], started);
             return result;
@@ -829,6 +1074,12 @@ impl OrientedBackend<'_> {
 
         let elapsed_ms = started.elapsed().as_millis();
         if elapsed_ms >= u128::from(config.timeout_ms) {
+            self.record_selection(
+                "none",
+                "probe_time_budget_exhausted",
+                forward_stats,
+                Some(reversed_stats),
+            );
             return stopped_after_orientation_probes(
                 BackendStatus::Timeout,
                 &forward,
@@ -841,6 +1092,12 @@ impl OrientedBackend<'_> {
             .saturating_add(reversed.visited_states);
         let remaining_states = config.max_product_states.saturating_sub(used_states);
         if remaining_states == 0 {
+            self.record_selection(
+                "none",
+                "probe_state_budget_exhausted",
+                forward_stats,
+                Some(reversed_stats),
+            );
             return stopped_after_orientation_probes(
                 BackendStatus::StateLimit,
                 &forward,
@@ -854,7 +1111,17 @@ impl OrientedBackend<'_> {
             (u128::from(config.timeout_ms) - elapsed_ms).min(u128::from(u64::MAX)) as u64;
         remaining.timeout_ms = remaining.timeout_ms.max(1);
 
-        let choose_reversed = prefer_reversed_probe(&forward, &reversed);
+        let (choose_reversed, reason) = choose_auto_orientation(&forward_stats, &reversed_stats);
+        self.record_selection(
+            if choose_reversed {
+                "reversed"
+            } else {
+                "forward"
+            },
+            reason,
+            forward_stats,
+            Some(reversed_stats),
+        );
         let mut result = if choose_reversed {
             if let Some(result) = self
                 .inner
@@ -1804,6 +2071,7 @@ fn base_report(
             name: backend.name().to_owned(),
             version: backend.version().to_owned(),
             orientation: backend.orientation().to_owned(),
+            orientation_selection: backend.orientation_selection(),
         },
         query,
         verdict,
@@ -1844,6 +2112,7 @@ fn unsupported_report(
             name: backend.name().to_owned(),
             version: backend.version().to_owned(),
             orientation: backend.orientation().to_owned(),
+            orientation_selection: None,
         },
         query,
         verdict: Verdict::Unsupported,
@@ -2155,6 +2424,85 @@ mod tests {
         );
         assert_eq!(report.witness.unwrap().codepoints, 30);
         assert!(report.statistics.visited_product_states <= 1_024);
+        let selection = report.backend.orientation_selection.unwrap();
+        assert_eq!(selection.selected, "reversed");
+        assert_eq!(selection.reason, "reversed_probe_definitive");
+        assert!(selection.reversed.is_some());
+    }
+
+    #[test]
+    fn auto_orientation_keeps_easy_forward_case_without_reverse_probe() {
+        let backend = OrientedBackend::new(&AutomataBackend, Orientation::Auto);
+        let report = analyze_binary_with_backend(
+            Query::Equivalent,
+            "a(b|c)",
+            "ab|ac",
+            &Config::default(),
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(report.verdict, Verdict::Yes);
+        let selection = report.backend.orientation_selection.unwrap();
+        assert_eq!(selection.selected, "forward");
+        assert_eq!(selection.reason, "forward_probe_definitive");
+        assert!(selection.reversed.is_none());
+    }
+
+    #[test]
+    fn auto_orientation_never_overspends_tiny_global_state_budget() {
+        let config = Config {
+            max_product_states: 1,
+            timeout_ms: 1_000,
+            ..Config::default()
+        };
+        let backend = OrientedBackend::new(&AutomataBackend, Orientation::Auto);
+        let report =
+            analyze_binary_with_backend(Query::Equivalent, "a", "a", &config, &backend).unwrap();
+        assert_eq!(report.verdict, Verdict::Unknown);
+        assert!(report.statistics.visited_product_states <= 1);
+        let selection = report.backend.orientation_selection.unwrap();
+        assert_eq!(selection.selected, "none");
+        assert_eq!(
+            selection.reason,
+            "forward_probe_exhausted_global_state_budget"
+        );
+        assert!(selection.reversed.is_none());
+    }
+
+    #[test]
+    fn auto_orientation_hysteresis_requires_material_reverse_win() {
+        fn stats(cost: u64) -> OrientationProbeStatistics {
+            OrientationProbeStatistics {
+                status: "state_limit".to_owned(),
+                visited_states: 100,
+                generated_transitions: 200,
+                state_budget: 100,
+                timeout_ms: 50,
+                state_pressure_milli: 1_000,
+                time_pressure_milli: 100,
+                transition_fanout_milli: 2_000,
+                start_subset_product: 1,
+                start_symbolic_branches: 2,
+                projected_cost: cost,
+            }
+        }
+
+        let forward = stats(1_000);
+        let near_tie = stats(850);
+        let clear_win = stats(790);
+        let zero = stats(0);
+        assert_eq!(
+            choose_auto_orientation(&zero, &zero),
+            (false, "forward_preferred_by_hysteresis")
+        );
+        assert_eq!(
+            choose_auto_orientation(&forward, &near_tie),
+            (false, "forward_preferred_by_hysteresis")
+        );
+        assert_eq!(
+            choose_auto_orientation(&forward, &clear_win),
+            (true, "reversed_projected_cost_materially_lower")
+        );
     }
 
     #[test]
