@@ -1,9 +1,10 @@
 # Analysis backends
 
-`regexrel` implements eight engines behind one CLI and library API. Select
+`regexrel` implements nine engines behind one CLI and library API. Select
 with `--backend <name>`. Six are fully independent decision procedures;
-`reversal` is an opt-in directional variant of `automata`, and `abstraction`
-is a CEGAR driver that delegates each abstract round *and* the concrete
+`reversal` is an opt-in directional variant of `automata`, `portfolio` is a
+composed hard-instance policy, and `abstraction` is a CEGAR driver that
+delegates each abstract round *and* the concrete
 fall-back to a configurable inner engine (default: `automata`; override with
 `--abstraction-inner`). Completed `YES` / `NO` results must agree across all
 engines.
@@ -56,17 +57,18 @@ backend.
 | `antimirov` | `antimirov.rs` | Antimirov partial derivatives (linear forms) + product BFS |
 | `antichain` | `antichain.rs` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
 | `hkc` | `hkc.rs` | Bisimulation up to congruence over a combined NFA (no determinization) |
+| `portfolio` | `portfolio.rs` | Unique-separator decomposition, then shared-budget automata/HKC fallback |
 | `abstraction` | `abstraction.rs` | Common-subexpression CEGAR; inner via `--abstraction-inner` |
 
 Cross-checking the six independent engines is intentional: a defect that is
 local to one implementation is far more likely to surface as a backend
 disagreement than as a silent shared wrong answer. Integration tests in
 `tests/backend_agreement.rs` exercise this across those six backends
-(`automata`, `minimized`, `derivatives`, `antimirov`, `antichain`, `hkc`) on
-every `cargo test` run. `reversal` is regression-tested against `automata`
-separately because it shares the same forward decision procedure, and
-`abstraction` has its own targeted unit tests in `abstraction.rs` plus
-concrete witness replay.
+(`automata`, `minimized`, `derivatives`, `antimirov`, `antichain`, `hkc`) and
+also run the composed `portfolio` policy as a regression check on every
+`cargo test`. `reversal` is regression-tested against `automata` separately
+because it shares the same forward decision procedure, and `abstraction` has
+its own targeted unit tests in `abstraction.rs` plus concrete witness replay.
 
 ---
 
@@ -413,7 +415,52 @@ suspect have redundant structure worth testing.
 
 ---
 
-## 8. `abstraction` — CEGAR common-subexpression reduction
+## 8. `portfolio` — separator decomposition + complementary fallback
+
+`portfolio` is a policy backend built for the failure modes exposed by the
+full backend/orientation experiment matrix. It does not replace the independent
+engines; it composes them under one budget.
+
+**Pipeline for `includes` / `equivalent`**
+
+1. Inspect the parsed ASTs for a common top-level singleton character that no
+   other component on either side can consume. This proves that every accepted
+   word contains that separator exactly once.
+2. For `A#B` versus `C#D`, use the unique split to reduce inclusion to the two
+   independent segment inclusions (with an explicit empty-source check).
+   Equivalence runs the two directional decomposed inclusions.
+3. Segment inclusion gets a small forward automata probe and then the exact
+   reverse-DAG automata search. Canonical shortest segment members are found
+   directly on the Thompson NFA without determinizing its history.
+4. Compose full counterexamples (`prefix + separator + suffix`) and compare all
+   candidates using the normal shortest-codepoint/lowest-scalar order.
+5. If no safe separator exists, or the bounded decomposition attempt is
+   inconclusive, spend at most two thirds of the remaining budget on automata;
+   if that is inconclusive, give HKC the actually remaining states/time.
+
+The separator attempt is capped at 8,192 states and 250 ms and never obtains a
+fresh caller budget. The separator proof requires the parsed AST, so direct
+library use of the NFA-only `RelationBackend::analyze_binary` entry point skips
+this fast path; `analyze_binary_with_backend` / `analyze_binary_expr` use it
+normally. Classes/dot/repeats that could also consume the candidate
+separator disable the optimization, so it is a proof-driven decomposition,
+not textual pattern matching. `overlap`, `empty`, and `match` currently use the
+automata path. The general `--orientation` wrapper remains orthogonal, so the
+recommended hard-instance configuration is `--backend portfolio --orientation auto`.
+
+The motivating family is `event_two_windows_n`: subset products time out once
+`n` grows, while the unique `#` splits the problem into one hard prefix window
+and one independent suffix window. The prefix relation becomes small after
+reversal. New benchmark cases extend this family through `n=512`.
+
+**When to use**
+
+Hard inclusion/equivalence workloads when no single backend is consistently
+best, especially record/protocol-style regexes with a delimiter or checkpoint.
+
+---
+
+## 9. `abstraction` — CEGAR common-subexpression reduction
 
 **Pipeline**
 
@@ -501,9 +548,9 @@ it anywhere in either pattern breaks the substitution `h` is supposed to be.
   gotten the full CEGAR speedup under `--alphabet ascii`. This is a real
   performance cost, not a rare corner case, for any Unicode-alphabet
   workload — the trade-off is deliberate (see `docs/limitations.md`).
-- Unlike the other six engines, it is not currently exercised by
-  `tests/backend_agreement.rs`'s differential fuzzing (see the note in the
-  overview above).
+- It is not currently exercised by `tests/backend_agreement.rs`'s
+  differential fuzzing. The six independent concrete engines and the composed
+  `portfolio` backend are covered there; abstraction retains targeted tests.
 
 **When to use**
 
@@ -587,6 +634,7 @@ equivalence of "same-ish" →  minimized
 equivalence, suspect redundant structure → hkc (cross-check; not a speed win — see §7)
 star / optional chains    →  derivatives  (and compare)
 nth-from-end / windows    →  try antichain first; still may UNKNOWN on very large windows
+hard mixed workload        →  portfolio + auto orientation
 agreement testing         →  run all six independent engines, require identical verdicts
 wide alternation residuals→  antimirov (compare to derivatives)
 large shared block        →  abstraction (inner defaults to automata;
@@ -599,6 +647,7 @@ large shared block        →  abstraction (inner defaults to automata;
 ./target/release/regexrel --backend reversal    --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend minimized   --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend derivatives --stats equivalent 'a+' 'aa*'
+./target/release/regexrel --backend portfolio   --orientation auto --stats equivalent 'a+' 'aa*'
 ./target/release/regexrel --backend abstraction --abstraction-inner derivatives --stats equivalent 'a+' 'aa*'
 ```
 

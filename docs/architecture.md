@@ -16,6 +16,7 @@ RelationBackend               │  abstraction rewrites the AST, then
   • antimirov   ←────────────┘
   • antichain
   • hkc          (overlap/empty delegate to automata / shared reachability)
+  • portfolio    (separator decomposition → automata/HKC shared-budget fallback)
   • abstraction  (wraps any of the above)
     ↓
 Report (text or JSON) + optional shortest witness
@@ -36,6 +37,7 @@ Report (text or JSON) + optional shortest witness
 | `antimirov` | **antimirov** backend: partial derivatives (linear forms) + product |
 | `antichain` | **antichain** backend: antichain inclusion (individual `A`-states × minimal-antichain `B`-subsets) |
 | `hkc` | **hkc** backend: bisimulation up to congruence over a combined NFA; `overlap`/`empty` delegate rather than implementing their own search |
+| `portfolio` | **portfolio** backend: unique-separator decomposition plus shared-budget automata/HKC fallback |
 | `abstraction` | **abstraction** backend: common-subexpression CEGAR reduction, delegates to a configurable inner engine (`--abstraction-inner`) |
 | `config` | TOML + CLI overrides; validated limits |
 | `report` | Verdicts, witnesses, timings, JSON schema v1 |
@@ -55,8 +57,8 @@ layer maps that into a user-facing `Verdict` (`YES` / `NO` / `UNKNOWN` /
 `UNSUPPORTED`), validates witnesses by independent replay, and fills timings.
 
 AST-aware entry points (`analyze_binary_expr` / `analyze_empty_expr`) let the
-derivatives backend avoid a pure-NFA path, and let the abstraction backend
-rewrite the AST (structurally-shared subexpressions → fresh marker symbols)
+derivatives backend avoid a pure-NFA path, let `portfolio` prove safe separator
+decompositions from syntax, and let the abstraction backend rewrite the AST (structurally-shared subexpressions → fresh marker symbols)
 before building NFAs at all; other backends ignore the AST and use the NFAs
 directly.
 

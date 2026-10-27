@@ -5,7 +5,7 @@ regular-expression subset: emptiness, overlap, inclusion, and equivalence. When
 a relation fails or overlap succeeds, it emits a **shortest** constructive
 witness.
 
-Eight interchangeable analysis engines implement the same contract:
+Nine interchangeable analysis engines implement the same contract:
 
 | `--backend` | Technique |
 |-------------|-----------|
@@ -16,6 +16,7 @@ Eight interchangeable analysis engines implement the same contract:
 | `antimirov` | Antimirov partial derivatives (linear forms) + product BFS |
 | `antichain` | Antichain inclusion (individual NFA-A states × minimal-antichain B-subsets) |
 | `hkc` | Bisimulation up to congruence over a combined NFA (no determinization) |
+| `portfolio` | Unique-separator decomposition, then automata/HKC under one shared budget |
 | `abstraction` | Common-subexpression abstraction + CEGAR over a configurable inner backend |
 
 Completed `YES` / `NO` answers are exact for the supported subset. Hitting a
@@ -29,7 +30,7 @@ direction is orthogonal to the backend via `--orientation`:
 | `auto` | For binary relations, probe forward and reversed directions, then continue in the cheaper one |
 
 This works with every backend, including `derivatives`, `antimirov`,
-`minimized`, `antichain`, `hkc`, and `abstraction`. The older
+`minimized`, `antichain`, `hkc`, `portfolio`, and `abstraction`. The older
 `--backend reversal` remains as the specialized automata-only compatibility
 mode with its bounded reverse probe. Details: [docs/backends.md](docs/backends.md),
 [SPEC.md](SPEC.md).
@@ -198,13 +199,29 @@ behaviour). It's ignored by every other `--backend` value:
 Compare engines on the same input:
 
 ```bash
-for b in automata reversal minimized derivatives antimirov antichain hkc abstraction; do
+for b in automata reversal minimized derivatives antimirov antichain hkc portfolio abstraction; do
   echo "== $b =="
   ./target/release/regexrel --backend "$b" --stats equivalent 'a+a+a+' 'a{3,}'
 done
 ```
 
 Full write-up: **[docs/backends.md](docs/backends.md)**.
+
+### `portfolio`
+
+A hard-instance policy backend. For `includes`/`equivalent`, it first detects a
+provably unique shared top-level separator (for example `#` in
+`[RW]*R[RW]{48}#[RW]{48}R[RW]*`) and decomposes the relation into independent
+left/right segment relations while preserving the global shortest-witness
+contract. If that does not apply or cannot finish inside its bounded slice, it
+runs automata first and gives the remaining *same* state/time budget to HKC.
+Use it with `--orientation auto` for the broadest hard-instance coverage.
+
+```bash
+regexrel --backend portfolio --orientation auto --stats \
+  equivalent '[RW]*R[RW]{128}#[RW]{128}R[RW]*' \
+             '[RW]*W[RW]{128}#[RW]{128}R[RW]*'
+```
 
 ## Drawing automata
 
@@ -356,10 +373,10 @@ assert_eq!(report.verdict, Verdict::Yes);
 # Ok::<(), regexrel::AnalyzeError>(())
 ```
 
-`AbstractionBackend` is exported for programmatic use alongside the other
-six (`AutomataBackend`, `MinimizedBackend`, `DerivativeBackend`,
-`AntimirovBackend`, `AntichainBackend`, `HkcBackend`), all implementing the
-shared `RelationBackend` trait:
+`PortfolioBackend` and `AbstractionBackend` are exported for programmatic use alongside
+the six independent engines (`AutomataBackend`, `MinimizedBackend`,
+`DerivativeBackend`, `AntimirovBackend`, `AntichainBackend`, `HkcBackend`), all
+implementing the shared `RelationBackend` trait:
 
 ```rust
 use regexrel::{analyze_binary_with_backend, AbstractionBackend, AutomataBackend, Config, Query};

@@ -212,6 +212,27 @@ fn reversal_backend_is_explicit_and_reported() {
 }
 
 #[test]
+fn portfolio_backend_is_explicit_and_reported() {
+    let output = Command::cargo_bin("regexrel")
+        .unwrap()
+        .args([
+            "--backend",
+            "portfolio",
+            "--json",
+            "equivalent",
+            "a#b",
+            "a#b",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["verdict"].as_str(), Some("YES"));
+    assert_eq!(report["backend"]["name"].as_str(), Some("portfolio"));
+}
+
+#[test]
 fn orientation_is_orthogonal_to_backend_selection() {
     let output = Command::cargo_bin("regexrel")
         .unwrap()

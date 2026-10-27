@@ -32,7 +32,7 @@ and configuration.
 
 ## 3. Analysis backends
 
-Eight engines implement the same contract (`RelationBackend`). Select with
+Nine engines implement the same contract (`RelationBackend`). Select with
 `--backend`. Completed `YES`/`NO` results must agree across backends; see
 [docs/backends.md](docs/backends.md).
 
@@ -72,13 +72,31 @@ shortest codepoint length but may select a different same-length witness after
 mapping back. Reports expose the active mode as `backend.orientation` and use
 `semantics.witness_order` to distinguish the two contracts.
 
-### 3.2 `automata` (default)
+### 3.2 `portfolio` (hard-instance policy)
+
+`portfolio` is a composition backend, not an independent proof procedure. For
+`includes` and `equivalent`, it first looks for a common top-level singleton
+separator character that no other component on either side can consume. Such a
+separator occurs exactly once in every accepted word and makes concatenation
+across the split injective. It can therefore decide `A#B ⊆ C#D` from the two
+segment inclusions (with the empty-source product handled explicitly), and
+equivalence from the two directional decomposed inclusions. Counterexamples
+are composed from canonical segment witnesses and shortest segment members,
+then compared by the normal global shortlex order. The decomposition attempt is
+bounded to 8,192 states / 250 ms and shares the caller budget.
+
+If decomposition is unavailable or inconclusive, `portfolio` spends at most
+two thirds of the remaining budget on automata and gives all actually remaining
+time/states to HKC. `overlap`, `empty`, and `match` keep the automata path. The
+outer `--orientation` layer still wraps the portfolio normally.
+
+### 3.3 `automata` (default)
 
 On-the-fly subset construction and a product BFS over pairs of NFA subsets.
 No upfront determinization. Symbolic transitions use charset partitions;
 lowest-codepoint representatives yield deterministic shortest witnesses.
 
-### 3.3 `reversal`
+### 3.4 `reversal`
 
 Runs a bounded product probe on the reversed languages for `includes` and
 `equivalent`, then falls back to the same forward subset-product search as
@@ -86,7 +104,7 @@ Runs a bounded product probe on the reversed languages for `includes` and
 `automata` never runs this probe. `overlap`, `empty`, and concrete `match`
 use the same paths as `automata`.
 
-### 3.4 `minimized`
+### 3.5 `minimized`
 
 1. Determinize each pattern to a DFA.  
 2. Minimize (Moore partition refinement).  
@@ -95,21 +113,21 @@ use the same paths as `automata`.
 4. Otherwise product-search the minimized DFAs (overlap, includes, empty, or
    non-isomorphic equivalence).
 
-### 3.5 `derivatives`
+### 3.6 `derivatives`
 
 Brzozowski residual expressions with normalization (empty/epsilon elimination,
 sorted deduplicated alternations, flattened concatenations). Product BFS over
 pairs of residuals; nullability decides acceptance. Counted repetition is
 expanded before derivation.
 
-### 3.6 `antimirov`
+### 3.7 `antimirov`
 
 Antimirov partial derivatives: each character produces a finite set of
 residuals (linear form). Product BFS over pairs of linear forms; a form
 accepts when any member is nullable. Language-equivalent residual theory to
 Brzozowski with a set-shaped state key.
 
-### 3.7 `antichain`
+### 3.8 `antichain`
 
 Antichain inclusion (De Wulf et al., CAV'06). `A` is explored as individual
 NFA states; `B` is tracked as a subset, pruned by subsumption against a
@@ -118,7 +136,7 @@ minimal antichain of previously-seen `(state, subset)` pairs. `overlap` and
 `includes` runs the antichain search directly; `equivalent` runs both
 directional inclusions, interleaved. Independent decision procedure.
 
-### 3.8 `hkc`
+### 3.9 `hkc`
 
 Bisimulation up to congruence (Bonchi & Pous, POPL'13). `A` and `B` are
 combined into one NFA over a shared, disjoint state space; the search
@@ -137,7 +155,7 @@ backends). Ships with the paper's *naive* congruence-closure check — see
 reproduce the technique's headline speedups against `minimized` on this
 project's hard suite.
 
-### 3.9 `abstraction`
+### 3.10 `abstraction`
 
 Common-subexpression CEGAR reduction. Subexpressions occurring structurally
 identically in both patterns are replaced by a shared fresh marker symbol;
@@ -147,13 +165,14 @@ abstract search exhausted with no counterexample; Overlap: found match, with
 every marker in the witness expanded back to a real substring) is returned
 directly. An abstract `NO`/`UNKNOWN` triggers counterexample-guided
 refinement, bounded by `MAX_REFINEMENT_ROUNDS`, after which analysis falls
-back to the inner engine on the original, unabstracted patterns. Unlike
-concrete backends 3.2–3.8, this is not an independent decision procedure — it
+back to the inner engine on the original, unabstracted patterns. Unlike the six
+independent engines (`automata`, `minimized`, `derivatives`, `antimirov`,
+`antichain`, `hkc`), this is not an independent decision procedure — it
 delegates to whichever inner engine is configured — but every internal
 round shares one `timeout_ms` budget, and every Overlap witness is expanded
 and independently replay-validated before it can reach the caller (§5).
 
-### 3.10 Limits
+### 3.11 Limits
 
 `max_product_states` (`--max-states`) and `timeout_ms` (`--timeout-ms`) bound
 all backends. Exhausting either yields `UNKNOWN`.
