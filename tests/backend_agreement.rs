@@ -33,7 +33,7 @@ use proptest::prelude::*;
 use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend,
     AntichainBackend, AntimirovBackend, AutomataBackend, Config, DerivativeBackend, HkcBackend,
-    MinimizedBackend, Query, RelationBackend,
+    MinimizedBackend, PortfolioBackend, Query, RelationBackend,
 };
 
 const AUTOMATA: AutomataBackend = AutomataBackend;
@@ -42,9 +42,10 @@ const DERIVATIVES: DerivativeBackend = DerivativeBackend;
 const ANTIMIROV: AntimirovBackend = AntimirovBackend;
 const ANTICHAIN: AntichainBackend = AntichainBackend;
 const HKC: HkcBackend = HkcBackend;
+const PORTFOLIO: PortfolioBackend = PortfolioBackend;
 
-/// Every independent decision procedure under test.
-fn backends() -> [&'static dyn RelationBackend; 6] {
+/// Every decision procedure or composed policy under agreement test.
+fn backends() -> [&'static dyn RelationBackend; 7] {
     [
         &AUTOMATA,
         &MINIMIZED,
@@ -52,6 +53,7 @@ fn backends() -> [&'static dyn RelationBackend; 6] {
         &ANTIMIROV,
         &ANTICHAIN,
         &HKC,
+        &PORTFOLIO,
     ]
 }
 

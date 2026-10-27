@@ -18,6 +18,7 @@ pub mod hkc;
 pub mod minimize;
 pub mod nfa;
 pub mod parser;
+pub mod portfolio;
 pub mod report;
 mod residual;
 
@@ -35,6 +36,7 @@ pub use draw::{draw_dot, render_graph, DrawError, DrawKind, DrawResult};
 pub use hkc::HkcBackend;
 pub use minimize::MinimizedBackend;
 pub use parser::{parse, FrontendError, FrontendErrorKind};
+pub use portfolio::PortfolioBackend;
 pub use report::{
     BackendInfo, OrientationProbeStatistics, OrientationSelection, Report, Verdict, Witness,
 };

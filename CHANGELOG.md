@@ -4,6 +4,20 @@ All notable changes are documented here.
 
 ## Unreleased
 
+- Added: `portfolio` backend for hard mixed workloads. For `includes` and
+  `equivalent`, it first detects a provably unique shared top-level singleton
+  separator and decomposes `A#B` versus `C#D` into exact independent segment
+  relations. Counterexamples are rebuilt from canonical segment witnesses and
+  shortest NFA paths, then globally shortlex-compared, so the optimization does
+  not weaken witness semantics. Ambiguous separators are rejected conservatively.
+  The decomposition attempt is capped at 8,192 states / 250 ms; if it does not
+  apply or cannot decide, `portfolio` spends at most two thirds of the remaining
+  shared budget on automata and gives HKC the actually remaining budget. Added
+  `event_two_windows_{64,96,128,256,512}_{includes,equivalent}` benchmarks and
+  regressions through `n=256`. The general `--orientation` layer remains
+  orthogonal; `--backend portfolio --orientation auto` is the intended
+  hard-instance policy.
+
 - Added: general-purpose backend orientation via
   `--orientation forward|reversed|auto` (default `forward`). `reversed` transforms both the
   parsed AST and compiled NFA before dispatch, so the same language reversal

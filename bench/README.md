@@ -46,8 +46,8 @@ Patterns like `(a|b)*a(a|b){n}` (nth-from-end is `a`) have **Θ(2ⁿ)** residual
 structure. They are intentional research targets: `automata`, `minimized`,
 `derivatives`, and `antimirov` may return `UNKNOWN` under default or raised
 limits. `antichain`'s one-sided subset tracking narrows this substantially
-(370/392 of this suite's benchmarks resolve `OK` under `--backend antichain`,
-22 `LIMIT`, 0 `FAIL`) but doesn't eliminate it. A `LIMIT` result on the
+(370/392 on the pre-portfolio benchmark suite resolved `OK` under
+`--backend antichain`, with 22 `LIMIT` and 0 `FAIL`) but doesn't eliminate it. A `LIMIT` result on the
 remainder is not a bad benchmark — it is a goalpost for further methods (a
 simulation preorder on top of antichain, suffix transducers, symbolic BDD
 windows, etc.).
@@ -55,6 +55,24 @@ windows, etc.).
 Also included: multi-window constraints, ternary alphabets, concatenated
 trackers, sparse double markers, wide alphabets, structural variants of the
 same language.
+
+The `event_two_windows_n` synchronizing-checkpoint family now extends through
+`n=512`. It is intentionally hard for whole-product subset search but has a
+unique `#` separator. `--backend portfolio --orientation auto` can prove the
+split and solve the independent segment relations instead of enumerating the
+combined two-window history. These larger cases are regression targets for the
+separator path, not claims that every multi-window regex is decomposable.
+
+Reproduce the focused frontier comparison (4 policies × 9 sizes × 2 queries ×
+3 repeats = 216 runs by default) after a release build:
+
+```bash
+python3 bench/portfolio_frontier.py
+```
+
+The script writes `bench/portfolio_frontier.csv`, checks every generated case
+against its known `NO` answer, and keeps `UNKNOWN`, crashes/nonzero exits, and
+harness timeouts distinct from successful timings.
 
 Engine notes: [docs/backends.md](../docs/backends.md).
 

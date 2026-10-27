@@ -2,8 +2,8 @@
 
 ## Backends
 
-All eight engines (`automata`, `reversal`, `minimized`, `derivatives`,
-`antimirov`, `antichain`, `hkc`, `abstraction`) decide the same regular subset. They may
+All nine engines (`automata`, `reversal`, `minimized`, `derivatives`,
+`antimirov`, `antichain`, `hkc`, `portfolio`, `abstraction`) decide the same regular subset. They may
 hit `max_product_states` or `timeout_ms` on different inputs; a completed
 `YES`/`NO` from any backend is exact. Suffix-tracking patterns such as
 `(a|b)*a(a|b){n}` can exhaust the forward `automata` backend while becoming
@@ -25,10 +25,17 @@ fanout, and start-frontier complexity, with a 20% hysteresis favoring forward.
 A misprediction can waste time or states but cannot change a completed verdict;
 explicit `forward`/`reversed` remain available for reproducible direction choice.
 
+`portfolio` is also not an independent decision procedure: it composes exact
+separator decomposition with the existing automata and HKC engines. The
+separator fast path only fires when a shared top-level singleton character is
+proved absent from every other component on both sides; ambiguous separators
+(for example a `#` also admitted by a class or dot) skip decomposition. Its
+internal attempts all debit one cumulative state/time budget.
+
 `abstraction` is another special case: it delegates to a configurable inner
 engine rather than being an independent decision procedure, so it is
 not currently exercised by the `tests/backend_agreement.rs` differential
-suite the other six are (see `docs/backends.md`). It only helps prove `YES` when the two
+suite used for the six independent engines and the composed `portfolio` regression path (see `docs/backends.md`). It only helps prove `YES` when the two
 patterns share a large subexpression verbatim; on a real `NO`, or on
 patterns with no shared structure (the nth-from-end family above, for
 instance), it falls back to `automata` with a small, bounded constant

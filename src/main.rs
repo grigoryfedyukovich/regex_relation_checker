@@ -9,7 +9,7 @@ use regexrel::{
     analyze_binary_with_backend, analyze_empty_with_backend, analyze_match_with_backend, draw_dot,
     render_graph, AbstractionBackend, AntichainBackend, AntimirovBackend, AutomataBackend,
     DerivativeBackend, DrawError, DrawKind, HkcBackend, MinimizedBackend, Orientation,
-    OrientedBackend, Query, RelationBackend, ReversalBackend,
+    OrientedBackend, PortfolioBackend, Query, RelationBackend, ReversalBackend,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -193,6 +193,11 @@ enum BackendArg {
     /// (`A ∪ B == B`); `overlap` delegates to `automata` (HKC brings no
     /// advantage there — nothing to determinize away).
     Hkc,
+    /// Complementary solver portfolio. First tries exact decomposition at a
+    /// provably unique shared separator, then uses bounded automata followed
+    /// by HKC under one shared state/time budget. Intended for hard instances
+    /// where the two engines have complementary failure modes.
+    Portfolio,
 }
 
 /// Concrete engine used inside `--backend abstraction`.
@@ -515,6 +520,7 @@ fn run(cli: Cli) -> Result<u8, (u8, String)> {
         (BackendArg::Antimirov, _) => &AntimirovBackend,
         (BackendArg::Antichain, _) => &AntichainBackend,
         (BackendArg::Hkc, _) => &HkcBackend,
+        (BackendArg::Portfolio, _) => &PortfolioBackend,
         (BackendArg::Abstraction, AbstractionInnerArg::Automata) => &abs_automata,
         (BackendArg::Abstraction, AbstractionInnerArg::Minimized) => &abs_minimized,
         (BackendArg::Abstraction, AbstractionInnerArg::Derivatives) => &abs_derivatives,
